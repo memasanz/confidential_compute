@@ -113,6 +113,8 @@ confidential ACI. Trade-off: ACI groups start in ~1–2 min (not milliseconds).
 | `deploy/skr-release-policy.json` | SKR key-release policy bound to MAA claims |
 | `deploy/deploy.ps1` | Build, push, create SKR key, gen CCE policy, deploy |
 | `examples/confidential_sandbox_demo.ipynb` | Service-principal client: upload Excel, compute average |
+| `examples/agent_framework_layer2_demo.ipynb` | Agent Framework: safe per-user session routing (Layer 2) |
+| `examples/.env.example` | Copy to `.env`; config for both notebooks |
 
 ## MCP tools
 
@@ -172,6 +174,23 @@ The caller identity is resolved by the auth middleware:
   (issuer `.../v2.0`, audience `ENTRA_AUDIENCE`).
 - **Dev mode** (local): with Entra unset, requests use the shared bearer token
   and the caller identity comes from the `X-Caller-Id` header (default `local`).
+
+### Per-user scoping for a shared agent (`X-User-Id`)
+
+When one agent (a single service principal) serves many end users, every request
+from that agent carries the **same** `oid`, so by itself the server cannot tell
+users apart. To get server-enforced per-user isolation without per-user tokens,
+the agent stamps an **`X-User-Id`** header with its *authenticated* end-user id.
+When present, the server folds it into the caller identity (`oid|user`), so each
+session is owned by the `(agent, user)` pair and `_require_owned` denies any
+cross-user access — even though all requests share one service principal.
+
+This is **Layer 1**: a guardrail against an honest-but-buggy agent. It trusts the
+agent to stamp the correct `X-User-Id`; a compromised agent could still lie. The
+only cryptographic guarantee is per-user tokens (On-Behalf-Of), where the user's
+own `oid` is validated by the enclave. Pair Layer 1 with **Layer 2** (the agent
+never lets the model choose a session/user id) — see
+`examples/agent_framework_layer2_demo.ipynb`.
 
 Because the ownership check runs inside the SEV-SNP TEE, an Azure operator or
 subscription admin cannot read session data even though they manage the

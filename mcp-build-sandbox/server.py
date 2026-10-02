@@ -81,6 +81,13 @@ current_caller: contextvars.ContextVar[str] = contextvars.ContextVar("current_ca
 
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
+# A per-end-user identifier the agent stamps on each request (X-User-Id header).
+# When present it is folded into the caller identity so sessions are owned by
+# (agent oid + user), giving server-enforced per-user isolation even though the
+# agent authenticates with a single service principal. Kept deliberately strict
+# so it can be embedded in the owner record without ambiguity.
+USER_ID_PATTERN = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
+
 mcp = FastMCP("confidential-code-sandbox", host=HOST, port=PORT)
 
 
@@ -408,6 +415,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
       object id (oid) as the caller identity.
     - Otherwise (local dev), require the shared bearer token and take the caller
       identity from the X-Caller-Id header.
+
+    In both modes, an optional X-User-Id header is folded into the caller
+    identity so that one agent (single service principal) can host many end
+    users with server-enforced per-user session isolation.
     """
 
     async def dispatch(self, request, call_next):
@@ -424,6 +435,15 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             if token and header != f"Bearer {token}":
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
             caller = request.headers.get("x-caller-id", "local")
+
+        # Fold an optional per-end-user id into the caller identity so sessions
+        # are owned by (agent + user). A caller may only reach sessions created
+        # under the exact same (agent, user) pair.
+        user_id = request.headers.get("x-user-id", "").strip()
+        if user_id:
+            if not USER_ID_PATTERN.fullmatch(user_id):
+                return JSONResponse({"error": "invalid x-user-id"}, status_code=400)
+            caller = f"{caller}|{user_id}"
 
         reset = current_caller.set(caller)
         try:
