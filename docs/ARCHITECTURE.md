@@ -94,10 +94,10 @@ leaves the HSM after attestation succeeds.
 | MCP server | `mcp-build-sandbox/server.py` | FastMCP app: session mgmt + code-exec tools, in-enclave HTTPS, ownership enforcement, auth middleware |
 | Container image | `mcp-build-sandbox/Dockerfile` | Python toolchain + server |
 | Dependencies | `mcp-build-sandbox/requirements.txt` | Python packages |
-| ARM template | `deploy/template.json` | Confidential ACI group (`sku: Confidential`, `ccePolicy`), 2 containers |
-| Parameters | `deploy/parameters.json` | Key Vault secret refs, managed identity, HSM/MAA endpoints, Entra audience |
-| SKR policy | `deploy/skr-release-policy.json` | Binds key release to SEV-SNP MAA claims + CCE hash |
-| Deploy script | `deploy/deploy.ps1` | Build → secrets → SKR key → `acipolicygen` → deploy |
+| ARM template | `infra\template.json` | Confidential ACI group (`sku: Confidential`, `ccePolicy`), 2 containers |
+| Parameters | `infra\parameters.json` | Key Vault secret refs, managed identity, HSM/MAA endpoints, Entra audience |
+| SKR policy | `infra\skr-release-policy.json` | Binds key release to SEV-SNP MAA claims + CCE hash |
+| Deploy script | `infra\deploy.ps1` | Build → secrets → SKR key → `acipolicygen` → deploy |
 
 ### Runtime containers (in the group)
 

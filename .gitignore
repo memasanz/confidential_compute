@@ -31,16 +31,18 @@ htmlcov/
 *.pfx
 *.crt
 *.cer
-deploy/tls/
+infra/tls/
 .env
 .env.*
+!.env.example
 *.local
 
 # ---- Azure ----
 .azure/
 
 # Deployment parameter/template files (contain subscription/tenant IDs, endpoints)
-deploy/*.json
+infra/*.json
+!infra/*.example.json
 
 # ---- Docker ----
 *.log

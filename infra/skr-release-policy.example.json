@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "anyOf": [
+    {
+      "authority": "https://sharedeus2.eus2.attest.azure.net",
+      "allOf": [
+        { "claim": "x-ms-attestation-type", "equals": "sevsnpvm" },
+        { "claim": "x-ms-sevsnpvm-is-debuggable", "equals": "false" },
+        { "claim": "x-ms-sevsnpvm-hostdata", "equals": "REPLACE_FINAL_CCE_POLICY_HASH" }
+      ]
+    }
+  ]
+}

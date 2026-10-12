@@ -76,13 +76,26 @@ $identityPrincipal = az identity show -g $ResourceGroup -n $Identity --query pri
 az keyvault role assignment create --hsm-name $Hsm --role "Managed HSM Crypto User" `
   --assignee $identityPrincipal --scope "/keys/$KeyName"
 
-# The release policy binds the key to MAA claims (the CCE policy hash). Put the hash
-# from step 6 into skr-release-policy.json BEFORE creating the key.
+# 6. Generate the CCE policy (written into template-vnet.json's ccePolicy field).
+az confcom acipolicygen -a .\template-vnet.json -p .\parameters-vnet.json --approve-wildcards
+if ($LASTEXITCODE -ne 0) {
+  throw "CCE policy generation failed."
+}
+$policyHash = & .\require-tls-policy.ps1
+$releasePolicy = Get-Content .\skr-release-policy.json -Raw | ConvertFrom-Json
+$hostDataClaims = @($releasePolicy.anyOf.allOf | Where-Object { $_.claim -eq "x-ms-sevsnpvm-hostdata" })
+if ($hostDataClaims.Count -ne 1) {
+  throw "Expected exactly one hostdata claim in the SKR release policy."
+}
+$hostDataClaims[0].equals = $policyHash
+$releasePolicy | ConvertTo-Json -Depth 20 | Set-Content .\skr-release-policy.json -Encoding utf8
+
+# Bind key release to the final policy, including its mandatory TLS rules.
 az keyvault key create --hsm-name $Hsm --name $KeyName --kty RSA --size 2048 `
   --exportable true --policy .\skr-release-policy.json
-
-# 6. Generate the CCE policy (written into template-vnet.json's ccePolicy field).
-az confcom acipolicygen -a .\template-vnet.json -p .\parameters-vnet.json
+if ($LASTEXITCODE -ne 0) {
+  throw "Attestation-bound key creation failed."
+}
 
 # 7. Deploy the confidential container group into the existing subnet.
 $miId     = az identity show -g $ResourceGroup -n $Identity --query id -o tsv
