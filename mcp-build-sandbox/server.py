@@ -1,21 +1,8 @@
-"""Confidential code-interpreter sandbox exposed over MCP.
+"""MCP execution worker. Separate confidential ACI groups are the OS boundary.
 
-An MCP server that gives an external agent isolated Python sessions to write,
-install packages into, and execute code. It is designed to run inside an Azure
-Container Instances confidential container group (AMD SEV-SNP TEE), so the work
-happens in a hardware-attested, memory-encrypted environment.
-
-Design (single-tenant):
-- The confidential container group is the trust boundary. Data in use is hidden
-  from the Azure host/operator and the image is pinned by the CCE policy.
-- A "session" is an isolated workspace directory with its own virtual
-  environment, giving each agent task a clean, separate Python environment.
-- The bearer token that gates the server is released from managed HSM only
-  after attestation (Secure Key Release), so credentials never exist in
-  host-visible configuration.
-
-Command model: free_run. The CCE policy pins only this server's image and
-entrypoint; commands the agent requests run as child processes of the server.
+The worker serves exactly one lifetime session, then requires controller group
+deletion. Workspace directories/venvs are NOT hostile-code isolation: arbitrary
+child processes share the worker's permissions, files and environment.
 """
 
 import base64
@@ -23,8 +10,8 @@ import contextvars
 import os
 import re
 import shutil
+import ssl
 import subprocess
-import tempfile
 import uuid
 import venv
 from pathlib import Path
@@ -33,34 +20,20 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from pool_worker import LifetimeSession, canonical_challenge, validate_tls
 
-# Root under which every isolated session lives.
+# Root for workspaces; these directories are not a security boundary.
 WORKSPACE = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
 SESSIONS_ROOT = WORKSPACE / "sessions"
 SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Session ownership records live outside the agent-writable session directories,
-# so code running in a session cannot tamper with who owns it.
-OWNERS_DIR = WORKSPACE / ".owners"
-OWNERS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Microsoft Entra ID validation. When configured, every request must carry a
-# valid Entra access token, and the caller's identity (the token's object id) is
-# used to enforce per-session ownership. Without it, the server runs in local
-# dev mode and takes the caller identity from an X-Caller-Id header.
-ENTRA_TENANT_ID = os.environ.get("ENTRA_TENANT_ID", "")
-ENTRA_AUDIENCE = os.environ.get("ENTRA_AUDIENCE", "")
-
-# Local REST endpoint of the confidential-computing attestation / SKR sidecar.
+# Local REST endpoint of the confidential-computing attestation sidecar
+# (image mcr.microsoft.com/aci/skr; used only to produce attestation reports).
 ATTESTATION_SIDECAR = os.environ.get("ATTESTATION_SIDECAR_URL", "http://localhost:8080")
 
-# Secure Key Release configuration. When MCP_AUTH_KID is set, the bearer token
-# is released from managed HSM after attestation instead of being passed in as
-# host-visible configuration.
+# MAA hostname the sidecar attests against. The variable name is historical but
+# kept because the deployed container-group policy pins it.
 SKR_MAA_ENDPOINT = os.environ.get("SKR_MAA_ENDPOINT", "")
-SKR_AKV_ENDPOINT = os.environ.get("SKR_AKV_ENDPOINT", "")
-MCP_AUTH_KID = os.environ.get("MCP_AUTH_KID", "")
 
 DEFAULT_TIMEOUT = int(os.environ.get("SANDBOX_COMMAND_TIMEOUT", "600"))
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
@@ -72,63 +45,36 @@ TLS_CERTFILE = os.environ.get("MCP_TLS_CERTFILE", "")
 TLS_KEYFILE = os.environ.get("MCP_TLS_KEYFILE", "")
 TLS_CERT = os.environ.get("MCP_TLS_CERT", "")
 TLS_KEY = os.environ.get("MCP_TLS_KEY", "")
-
-# Mutable holder so the middleware sees the token resolved at startup.
-_auth = {"token": os.environ.get("MCP_AUTH_TOKEN", "")}
+TLS_CLIENT_CA = os.environ.get("MCP_TLS_CLIENT_CA", "")
+TLS_CLIENT_CAFILE = os.environ.get("MCP_TLS_CLIENT_CAFILE", "")
+WORKER_HOSTNAME = os.environ.get("MCP_WORKER_HOSTNAME", "")
+if os.environ.get("MCP_WORKER_MODE", "pooled") != "pooled":
+    raise ValueError("Only pooled mode is supported (MCP_WORKER_MODE=pooled)")
+pool = LifetimeSession(WORKSPACE, os.environ.get("MCP_WORKER_ID", ""),
+                       os.environ.get("MCP_SESSION_ID", ""))
+TLS_SPKI_SHA256 = ""
 
 # The identity of the caller handling the current request.
 current_caller: contextvars.ContextVar[str] = contextvars.ContextVar("current_caller", default="")
 
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
-# A per-end-user identifier the agent stamps on each request (X-User-Id header).
-# When present it is folded into the caller identity so sessions are owned by
-# (agent oid + user), giving server-enforced per-user isolation even though the
-# agent authenticates with a single service principal. Kept deliberately strict
-# so it can be embedded in the owner record without ambiguity.
-USER_ID_PATTERN = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
-
 mcp = FastMCP("confidential-code-sandbox", host=HOST, port=PORT)
 
 
-# --- ownership ----------------------------------------------------------------
-
-def _owner_path(session_id: str) -> Path:
-    """Path to a session's ownership record (outside the session workspace)."""
-    if not SESSION_ID_PATTERN.fullmatch(session_id):
-        raise ValueError(f"Invalid session id: {session_id!r}")
-    return OWNERS_DIR / session_id
-
-
-def _set_owner(session_id: str, caller: str) -> None:
-    _owner_path(session_id).write_text(caller, encoding="utf-8")
-
-
-def _get_owner(session_id: str) -> str | None:
-    path = _owner_path(session_id)
-    return path.read_text(encoding="utf-8") if path.exists() else None
-
+# --- authorization ------------------------------------------------------------
 
 def _require_owned(session_id: str) -> Path:
-    """Authorize the current caller for a session, returning its directory.
-
-    Only the identity that created the session may access it. This is enforced
-    inside the attested enclave, so neither other callers nor infrastructure
-    admins can reach another caller's session data.
-    """
-    caller = current_caller.get()
-    owner = _get_owner(session_id)
-    if owner is None:
-        raise ValueError(f"Session {session_id} not found")
-    if owner != caller:
-        raise PermissionError("Only the session creator may access this session")
+    """API authorization only; arbitrary code within this group can bypass it."""
+    _require_gateway()
+    pool.require(session_id)
     return _session_dir(session_id)
 
 
 # --- session and path helpers -------------------------------------------------
 
 def _session_dir(session_id: str) -> Path:
-    """Resolve a session's isolated directory, validating the id."""
+    """Resolve a workspace directory, validating the id (not OS isolation)."""
     if not SESSION_ID_PATTERN.fullmatch(session_id):
         raise ValueError(f"Invalid session id: {session_id!r}")
     return (SESSIONS_ROOT / session_id).resolve()
@@ -184,35 +130,34 @@ def _run_shell(command: str, cwd: Path, timeout: int) -> str:
 
 @mcp.tool()
 def create_session(session_id: str = "") -> str:
-    """Create a new isolated code-execution session with its own Python venv.
-
-    The calling identity becomes the session's sole owner; no other caller (or
-    admin) can access it. Returns the session id to pass to the other tools.
-    """
-    session_id = session_id or f"s-{uuid.uuid4().hex[:12]}"
-    if _get_owner(session_id) is not None:
-        raise ValueError(f"Session {session_id} already exists")
-    _ensure_session(session_id)
-    _set_owner(session_id, current_caller.get())
+    """Create the workspace/venv; consumes the worker's sole lifetime session."""
+    _require_gateway()
+    session_id = session_id or pool.session_id
+    pool.require(session_id, active=False)
+    pool.transition("active")
+    try:
+        _ensure_session(session_id)
+    except Exception:
+        pool.transition("retired")
+        raise
     return session_id
 
 
 @mcp.tool()
 def list_sessions() -> str:
-    """List the caller's own session ids."""
-    caller = current_caller.get()
-    ids = [p.name for p in sorted(OWNERS_DIR.iterdir()) if _get_owner(p.name) == caller]
-    return "\n".join(ids) or "(none)"
+    """List this worker's session id, if active."""
+    _require_gateway()
+    return pool.session_id if pool.require(active=False) == "active" else "(none)"
 
 
 @mcp.tool()
 def delete_session(session_id: str) -> str:
-    """Delete a session and everything in it (owner only)."""
+    """Retire the session and remove its workspace; does NOT delete the ACI group."""
     session_dir = _require_owned(session_id)
+    pool.transition("retired")
     if session_dir.exists():
         shutil.rmtree(session_dir)
-    _owner_path(session_id).unlink(missing_ok=True)
-    return f"Deleted session {session_id}"
+    return f"Retired session {session_id}; controller must destroy the Azure group"
 
 
 # --- file tools ---------------------------------------------------------------
@@ -322,130 +267,44 @@ def git_clone(session_id: str, repo_url: str, directory: str = "repo") -> str:
 # --- attestation --------------------------------------------------------------
 
 @mcp.tool()
-def get_attestation() -> str:
-    """Return a signed SEV-SNP attestation token from the sidecar.
+def get_attestation(nonce: str = "") -> str:
+    """Obtain evidence, not proof of analysis correctness. Clients must verify it.
 
-    The client should verify this token (via Microsoft Azure Attestation) before
-    trusting results, to prove the code ran in a genuine, untampered enclave.
+    Pooled evidence binds a fresh client challenge to this TLS public key.
+    Authenticated pre-allocation attestation is allowed before activation.
     """
+    _require_gateway()
+    pool.require(active=False)
+    runtime_data = base64.b64encode(canonical_challenge(
+        pool.worker_id, pool.session_id, nonce, TLS_SPKI_SHA256
+    )).decode("ascii")
     try:
         response = httpx.post(
             f"{ATTESTATION_SIDECAR}/attest/maa",
-            json={"maa_endpoint": SKR_MAA_ENDPOINT, "runtime_data": ""},
+            json={"maa_endpoint": SKR_MAA_ENDPOINT, "runtime_data": runtime_data},
             timeout=30,
         )
         response.raise_for_status()
+        result = response.json()
+        if not isinstance(result.get("token"), str) or not result["token"]:
+            raise RuntimeError("Sidecar did not return an MAA token")
         return response.text
-    except Exception as exc:  # noqa: BLE001 - surface any sidecar issue to caller
-        return f"Attestation unavailable: {exc}"
-
-
-# --- secure key release (attestation-gated bearer token) ----------------------
-
-def _release_secret(kid: str) -> str:
-    """Release a key from managed HSM via the sidecar, gated on attestation.
-
-    The sidecar produces an MAA token from the SEV-SNP report and presents it to
-    managed HSM, which only releases the key if the token satisfies the key's
-    release policy. So the token is unavailable outside a genuine enclave.
-    """
-    response = httpx.post(
-        f"{ATTESTATION_SIDECAR}/key/release",
-        json={
-            "maa_endpoint": SKR_MAA_ENDPOINT,
-            "akv_endpoint": SKR_AKV_ENDPOINT,
-            "kid": kid,
-        },
-        timeout=30,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Secure Key Release failed ({response.status_code}): {response.text}"
-        )
-    return response.json()["key"]
-
-
-def _resolve_auth_token() -> None:
-    """Resolve the attestation-gated bearer token via Secure Key Release.
-
-    When Entra ID gates the server, request authentication uses the Entra access
-    token and this released secret is not required, so a release failure is
-    logged but non-fatal. In local/dev mode (no Entra) the released token is the
-    only credential, so a failure there is fatal.
-    """
-    if _auth["token"] or not MCP_AUTH_KID:
-        return
-    try:
-        _auth["token"] = _release_secret(MCP_AUTH_KID)
-    except Exception as exc:  # noqa: BLE001 - surface the real SKR error
-        if ENTRA_TENANT_ID and ENTRA_AUDIENCE:
-            print(f"[skr] continuing without released token (Entra auth active): {exc}", flush=True)
-        else:
-            raise
+    except Exception as exc:  # noqa: BLE001 - any sidecar issue means untrusted
+        raise RuntimeError("Attestation failed; worker must not be trusted") from exc
 
 
 # --- transport ----------------------------------------------------------------
 
-def _validate_entra_token(token: str) -> str:
-    """Validate an Entra access token and return the caller's object id (oid)."""
-    import jwt  # imported lazily so local dev mode needs no PyJWT
-    from jwt import PyJWKClient
+class GatewayAuthMiddleware(BaseHTTPMiddleware):
+    """Mark every request as coming from the gateway.
 
-    jwks = PyJWKClient(
-        f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/discovery/v2.0/keys"
-    )
-    signing_key = jwks.get_signing_key_from_jwt(token)
-    claims = jwt.decode(
-        token,
-        signing_key.key,
-        algorithms=["RS256"],
-        audience=ENTRA_AUDIENCE,
-        issuer=f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/v2.0",
-    )
-    caller = claims.get("oid") or claims.get("sub")
-    if not caller:
-        raise ValueError("Token has no caller identity")
-    return caller
-
-
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Authenticate the caller and record their identity for ownership checks.
-
-    - When Entra is configured, require a valid Entra access token and use its
-      object id (oid) as the caller identity.
-    - Otherwise (local dev), require the shared bearer token and take the caller
-      identity from the X-Caller-Id header.
-
-    In both modes, an optional X-User-Id header is folded into the caller
-    identity so that one agent (single service principal) can host many end
-    users with server-enforced per-user session isolation.
+    The app is exposed ONLY through uvicorn's CERT_REQUIRED listener, so a request
+    that reaches it already presented a client cert from the gateway CA. No
+    forwarded identity headers or client-supplied caller IDs are honored.
     """
 
     async def dispatch(self, request, call_next):
-        header = request.headers.get("authorization", "")
-        if ENTRA_TENANT_ID and ENTRA_AUDIENCE:
-            if not header.startswith("Bearer "):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            try:
-                caller = _validate_entra_token(header[len("Bearer "):])
-            except Exception:  # noqa: BLE001 - any validation failure is a 401
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-        else:
-            token = _auth["token"]
-            if token and header != f"Bearer {token}":
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            caller = request.headers.get("x-caller-id", "local")
-
-        # Fold an optional per-end-user id into the caller identity so sessions
-        # are owned by (agent + user). A caller may only reach sessions created
-        # under the exact same (agent, user) pair.
-        user_id = request.headers.get("x-user-id", "").strip()
-        if user_id:
-            if not USER_ID_PATTERN.fullmatch(user_id):
-                return JSONResponse({"error": "invalid x-user-id"}, status_code=400)
-            caller = f"{caller}|{user_id}"
-
-        reset = current_caller.set(caller)
+        reset = current_caller.set("gateway-mtls")
         try:
             return await call_next(request)
         finally:
@@ -453,11 +312,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 def _materialize_pem(content: str, suffix: str) -> str:
-    """Write PEM content to a temp file and return its path."""
-    handle = tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False, encoding="utf-8")
-    handle.write(content)
-    handle.close()
-    return handle.name
+    """Materialize configured PEM inside the worker workspace, never OS temp."""
+    directory = WORKSPACE / ".transport"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    path = directory / f"{uuid.uuid4().hex}{suffix}"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return str(path)
 
 
 def _tls_files() -> tuple[str | None, str | None]:
@@ -467,12 +329,26 @@ def _tls_files() -> tuple[str | None, str | None]:
     return certfile, keyfile
 
 
-if __name__ == "__main__":
-    _resolve_auth_token()
-    app = mcp.streamable_http_app()
-    app.add_middleware(BearerAuthMiddleware)
+def _require_gateway():
+    if current_caller.get() != "gateway-mtls":
+        raise PermissionError("Authenticated gateway mTLS request required")
+
+
+def transport_options():
+    global TLS_SPKI_SHA256
     certfile, keyfile = _tls_files()
-    if certfile and keyfile:
-        uvicorn.run(app, host=HOST, port=PORT, ssl_certfile=certfile, ssl_keyfile=keyfile)
-    else:
-        uvicorn.run(app, host=HOST, port=PORT)
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", SKR_MAA_ENDPOINT) or "." not in SKR_MAA_ENDPOINT:
+        raise ValueError("SKR_MAA_ENDPOINT must be a hostname only")
+    cafile = TLS_CLIENT_CAFILE or (
+        _materialize_pem(TLS_CLIENT_CA, ".ca") if TLS_CLIENT_CA else None)
+    TLS_SPKI_SHA256 = validate_tls(certfile, keyfile, cafile, WORKER_HOSTNAME)
+    return dict(ssl_certfile=certfile, ssl_keyfile=keyfile,
+                ssl_ca_certs=cafile, ssl_cert_reqs=ssl.CERT_REQUIRED,
+                proxy_headers=False)
+
+
+if __name__ == "__main__":
+    options = transport_options()
+    app = mcp.streamable_http_app()
+    app.add_middleware(GatewayAuthMiddleware)
+    uvicorn.run(app, host=HOST, port=PORT, **options)

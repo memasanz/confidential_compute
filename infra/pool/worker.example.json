@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "name": {"type": "string"},
+    "location": {"type": "string", "defaultValue": "eastus2"},
+    "subnetId": {"type": "string"},
+    "image": {"type": "string"},
+    "workerId": {"type": "string"},
+    "sessionId": {"type": "string"},
+    "workerHostname": {"type": "string"},
+    "maaEndpoint": {"type": "string"},
+    "tlsCert": {"type": "securestring"},
+    "tlsKey": {"type": "securestring"},
+    "clientCa": {"type": "string"}
+  },
+  "resources": [{
+    "type": "Microsoft.ContainerInstance/containerGroups",
+    "apiVersion": "2023-05-01",
+    "name": "[parameters('name')]",
+    "location": "[parameters('location')]",
+    "properties": {
+      "confidentialComputeProperties": {"ccePolicy": ""},
+      "sku": "Confidential",
+      "osType": "Linux",
+      "restartPolicy": "Always",
+      "subnetIds": [{"id": "[parameters('subnetId')]"}],
+      "containers": [{
+        "name": "mcp-server",
+        "properties": {
+          "image": "[parameters('image')]",
+          "ports": [{"port": 8000, "protocol": "TCP"}],
+          "environmentVariables": [
+            {"name": "MCP_WORKER_MODE", "value": "pooled"},
+            {"name": "MCP_WORKER_ID", "value": "[parameters('workerId')]"},
+            {"name": "MCP_SESSION_ID", "value": "[parameters('sessionId')]"},
+            {"name": "MCP_WORKER_HOSTNAME", "value": "[parameters('workerHostname')]"},
+            {"name": "MCP_TLS_CLIENT_CA", "value": "[parameters('clientCa')]"},
+            {"name": "MCP_TLS_CERT", "secureValue": "[parameters('tlsCert')]"},
+            {"name": "MCP_TLS_KEY", "secureValue": "[parameters('tlsKey')]"},
+            {"name": "SKR_MAA_ENDPOINT", "value": "[parameters('maaEndpoint')]"},
+            {"name": "ATTESTATION_SIDECAR_URL", "value": "http://localhost:8080"}
+          ],
+          "resources": {"requests": {"cpu": 2, "memoryInGB": 4}}
+        }
+      }, {
+        "name": "attestation-sidecar",
+        "properties": {
+          "image": "mcr.microsoft.com/aci/skr:2.7",
+          "ports": [{"port": 8080, "protocol": "TCP"}],
+          "resources": {"requests": {"cpu": 1, "memoryInGB": 1}}
+        }
+      }],
+      "ipAddress": {"type": "Private", "ports": [{"port": 8000, "protocol": "TCP"}]}
+    }
+  }]
+}

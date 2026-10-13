@@ -1,0 +1,13 @@
+{
+  "Name": "Confidential Pool Worker Subnet Join",
+  "Description": "Join resources to one delegated worker subnet. Assign at subnet scope only.",
+  "Actions": [
+    "Microsoft.Network/virtualNetworks/read",
+    "Microsoft.Network/virtualNetworks/subnets/read",
+    "Microsoft.Network/virtualNetworks/subnets/join/action"
+  ],
+  "NotActions": [],
+  "AssignableScopes": [
+    "/subscriptions/{SUBSCRIPTION}/resourceGroups/{VNET_RG}"
+  ]
+}

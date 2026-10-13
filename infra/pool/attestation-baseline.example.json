@@ -1,0 +1,5 @@
+{
+  "comment": "User-approved 2026-10-12 from observed ACI SEV-SNP (Genoa) MAA claims; SMT enabled is an accepted residual risk. Re-review when platform SVNs change.",
+  "allow_smt": true,
+  "minimum_svn": {"bootloader": 10, "tee": 0, "snpfw": 23, "microcode": 84, "guest": 2, "uvm_guest": 104}
+}

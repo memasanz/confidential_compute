@@ -1,0 +1,16 @@
+{
+  "Name": "Confidential Pool ACI Worker Manager",
+  "Description": "Create, read, and delete confidential ACI worker groups. No role assignment, no other resource types.",
+  "Actions": [
+    "Microsoft.ContainerInstance/containerGroups/read",
+    "Microsoft.ContainerInstance/containerGroups/write",
+    "Microsoft.ContainerInstance/containerGroups/delete",
+    "Microsoft.ContainerInstance/locations/operations/read",
+    "Microsoft.ContainerInstance/locations/operationresults/read",
+    "Microsoft.Resources/subscriptions/resourceGroups/read"
+  ],
+  "NotActions": [],
+  "AssignableScopes": [
+    "/subscriptions/{SUBSCRIPTION}/resourceGroups/{WORKER_RG}"
+  ]
+}

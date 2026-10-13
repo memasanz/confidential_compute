@@ -1,0 +1,14 @@
+{
+  "Name": "Confidential Pool DNS A Record Writer",
+  "Description": "Manage A records in one private DNS zone. Assign at zone scope only.",
+  "Actions": [
+    "Microsoft.Network/privateDnsZones/read",
+    "Microsoft.Network/privateDnsZones/A/read",
+    "Microsoft.Network/privateDnsZones/A/write",
+    "Microsoft.Network/privateDnsZones/A/delete"
+  ],
+  "NotActions": [],
+  "AssignableScopes": [
+    "/subscriptions/{SUBSCRIPTION}/resourceGroups/{CONTROL_RG}"
+  ]
+}

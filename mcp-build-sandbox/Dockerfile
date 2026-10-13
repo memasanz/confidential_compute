@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir pandas openpyxl pytest
 
 COPY server.py .
+COPY pool_worker.py .
 
 # Ephemeral per-run workspace for agent code.
 RUN mkdir -p /workspace

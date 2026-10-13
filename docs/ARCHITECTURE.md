@@ -1,138 +1,89 @@
 # Architecture
 
+**Architecture:** [Confidential analysis session pool](isolated-session-pool.md)
+(decisions, trust boundaries, rollout gates). Pricing is in
+[pool cost estimates](session-pool-costs.md); onboarding is in
+[getting started](getting-started.md) and the [pilot guide](pilot-guide.md).
+
 A confidential code-interpreter that an AI agent drives over **MCP**. The agent
-stays outside; code executes inside an **Azure Container Instances confidential
-container group** (AMD SEV-SNP TEE), so work is memory-encrypted, hidden from the
-host/operator, and provable via attestation.
+stays outside. Each analysis session runs in its **own Azure Container Instances
+confidential container group** (AMD SEV-SNP TEE), so work is memory-encrypted,
+hidden from the host/operator, and provable via attestation. A single private
+**gateway** authenticates callers with Entra and routes each session to its
+worker; a **controller** keeps a bounded pool of ready workers and destroys each
+one after use.
 
-## Diagram (VNet-injected deployment)
-
-Deployed **into an existing secured VNet** (`vnet-fabric-foundry`, 192.168.0.0/16).
-The container group gets a **private IP only** — no public IP. Callers reach it
-from inside the VNet or over the VPN gateway. Secrets are passed as secure
-deployment parameters (the org policy forces Key Vault to private-only, so the
-standard Key Vault is bypassed).
+## Diagram
 
 ```mermaid
 flowchart LR
-    subgraph OnPrem["Caller side (VPN / in-VNet)"]
-        Agent["AI agent / MCP client<br/>(Foundry agents, Copilot, ...)"]
-    end
+    Agent["AI agent / MCP client<br/>(VPN or in-VNet)"]
+    Entra["Microsoft Entra ID"]
+    MAA["Microsoft Azure Attestation (MAA)<br/>(public, reached via NAT)"]
 
-    subgraph Azure["Azure"]
-        MAA["Microsoft Azure Attestation (MAA)<br/>(public — no private endpoint)"]
-        Entra["Microsoft Entra ID<br/>token issuer / JWKS"]
-
-        subgraph VNet["vnet-fabric-foundry — 192.168.0.0/16"]
-            VPN["VPN Gateway<br/>+ DNS Private Resolver"]
-
-            subgraph SNETACI["snet-aci 192.168.3.0/28<br/>(delegated: Microsoft.ContainerInstance/containerGroups)"]
-                subgraph TEE["Confidential Container Group — SEV-SNP TEE (Private IP, no public IP)"]
-                    direction TB
-                    MCP["mcp-server<br/>FastMCP (server.py)<br/>• isolated sessions (dir + venv)<br/>• TLS terminates HERE<br/>• per-session ownership"]
-                    SKRSC["attestation-sidecar<br/>aci/skr:2.7 · localhost:8080"]
-                    MCP <--> SKRSC
-                end
-            end
-
-            NAT["NAT Gateway + Public IP<br/>(egress-only)"]
-
-            subgraph SNETPE["snet-pe 192.168.0.0/24 (private endpoints)"]
-                PEHSM["PE → Managed HSM"]
-                PEACR["PE → ACR"]
-            end
+    subgraph VNet["vnet-fabric-foundry, 192.168.0.0/16"]
+        subgraph Control["snet-pool-control 192.168.5.0/27 (internal Container Apps env)"]
+            GW["pool-gateway<br/>Entra auth, ownership, tool routing"]
+            CTL["pool-controller<br/>provision, verify attestation,<br/>replenish, retire, reconcile"]
         end
-
-        HSM["Managed HSM<br/>mcp-auth-token key (SKR policy)"]
-        ACR["Azure Container Registry<br/>mcp-build-sandbox image"]
-        MI["User-assigned Managed Identity<br/>AcrPull + Managed HSM Crypto User"]
+        Table[("Table poolstate<br/>(private endpoint, Entra only)")]
+        subgraph Workers["snet-pool-workers 192.168.6.0/24 (NSG nsg-pool-workers)"]
+            W1["Confidential group A<br/>mcp-server + attestation sidecar"]
+            W2["Confidential group B<br/>mcp-server + attestation sidecar"]
+        end
+        NAT["NAT gateway natgw-aci<br/>+ pip-aci-nat (egress only)"]
     end
+    ACR["ACR acrconfmcpvisdzn"]
 
-    Agent -- "MCP over HTTPS (Entra token) — private IP" --> MCP
-    VPN -. "private DNS resolution" .-> PEHSM
-    SKRSC -- "attestation call (outbound)" --> NAT
+    Agent -- "MCP over HTTPS + Entra token" --> GW
+    Agent -. "validate token" .-> Entra
+    GW <--> Table
+    CTL <--> Table
+    GW -- "mutual TLS" --> W1
+    GW -- "mutual TLS" --> W2
+    CTL -- "create / delete groups" --> Workers
+    W1 -- "attestation (outbound)" --> NAT
     NAT --> MAA
-    Agent -. "verify SEV-SNP token" .-> MAA
-    SKRSC -- "Secure Key Release" --> PEHSM
-    PEHSM --> HSM
-    MCP -- "image pull" --> PEACR
-    PEACR --> ACR
-    MI -. "auth for pull + SKR" .-> MCP
-    Entra -. "validate token (JWKS, via egress)" .-> MCP
-    CCE["CCE policy<br/>(pins image + entrypoint)"] -. "hostdata hash gates release" .-> HSM
+    CTL -. "verify MAA token + policy" .-> MAA
+    Workers -- "image pull (pull-only identity)" --> ACR
 ```
 
-Everything inside the **TEE** box is memory-encrypted and hidden from the Azure
-host/operator. TLS terminates *inside* the enclave, and the bearer key only
-leaves the HSM after attestation succeeds.
-
-### Network design notes
-
-- **No public IP on the group.** In a VNet, a confidential container group gets a
-  private IP only; the MCP endpoint (`https://<private-ip>:8000/mcp`) is reachable
-  from inside the VNet or over the VPN gateway.
-- **Dedicated delegated subnet** `snet-aci` (192.168.3.0/28), delegated to
-  `Microsoft.ContainerInstance/containerGroups`.
-- **NAT gateway (egress-only public IP).** A VNet-injected ACI group has no default
-  outbound; a NAT gateway is the supported egress path. Its public IP is
-  **outbound-only** (no inbound listener) and is needed because **Microsoft Azure
-  Attestation has no private endpoint**, so the attestation call must egress. The
-  VNet has no existing firewall/UDR egress, so NAT gateway is the best fit.
-- **Private endpoints** for Managed HSM (`privatelink.managedhsm.azure.net`) and
-  ACR (`privatelink.azurecr.io`, zone already present) keep key release and image
-  pulls on the private network.
-- **Key Vault bypassed.** Org policy `KeyVault_PublicNetwork_Modify` forces the
-  standard Key Vault private-only; instead the ACR password and TLS cert/key are
-  passed as `securestring` deployment parameters.
+The **TEE** protects each worker's memory from the infrastructure host. Code
+inside a worker, and the gateway/controller/PKI administrators, remain trusted.
+The gateway and controller are ordinary Container Apps, not confidential.
 
 ## Components
 
-### In the repo
-
-| Component | File | Role |
+| Component | Location | Role |
 |---|---|---|
-| MCP server | `mcp-build-sandbox/server.py` | FastMCP app: session mgmt + code-exec tools, in-enclave HTTPS, ownership enforcement, auth middleware |
-| Container image | `mcp-build-sandbox/Dockerfile` | Python toolchain + server |
-| Dependencies | `mcp-build-sandbox/requirements.txt` | Python packages |
-| ARM template | `infra\template.json` | Confidential ACI group (`sku: Confidential`, `ccePolicy`), 2 containers |
-| Parameters | `infra\parameters.json` | Key Vault secret refs, managed identity, HSM/MAA endpoints, Entra audience |
-| SKR policy | `infra\skr-release-policy.json` | Binds key release to SEV-SNP MAA claims + CCE hash |
-| Deploy script | `infra\deploy.ps1` | Build → secrets → SKR key → `acipolicygen` → deploy |
+| Worker (MCP server) | `mcp-build-sandbox\server.py`, `pool_worker.py` | FastMCP app serving exactly one lifetime session over mutual TLS; file and code-execution tools; `get_attestation` |
+| Worker image | `mcp-build-sandbox\Dockerfile` | Python/pandas toolchain + worker |
+| Attestation sidecar | `mcr.microsoft.com/aci/skr` | Produces SNP/MAA evidence at `localhost:8080`; used only for attestation, no key release |
+| Gateway / controller | `pool-control\` | Entra-authenticated gateway, lease store access, controller, Azure adapter, PKI material |
+| Pool infrastructure | `infra\pool\` | Bicep + scripts: subnets, NSG, identities, Table, DNS, environment, policy generation |
+| Client examples | `examples\` | `pooled_analysis.py`, `pin_gateway_cert.py`, `pool_feasibility.py` |
 
-### Runtime containers (in the group)
+### MCP tools
 
-- **`mcp-server`** — the code interpreter; TLS terminates here.
-- **`attestation-sidecar`** — `mcr.microsoft.com/aci/skr:2.7`, performs attestation
-  and Secure Key Release at `localhost:8080`.
-
-### Azure resources
-
-- **VNet** `vnet-fabric-foundry` (existing, 192.168.0.0/16) — target network.
-- **Delegated subnet** `snet-aci` (192.168.3.0/28) — delegated to
-  `Microsoft.ContainerInstance/containerGroups`; hosts the confidential group.
-- **NAT gateway + public IP** — egress-only outbound for the ACI subnet (needed for
-  the MAA attestation call, which has no private endpoint).
-- **NSG** on `snet-aci` — restricts traffic to/from the group.
-- **ACR** — image registry, reached via **private endpoint** (`privatelink.azurecr.io`).
-- **Managed HSM** — holds the attestation-gated bearer key, reached via **private
-  endpoint** (`privatelink.managedhsm.azure.net`).
-- **User-assigned Managed Identity** — AcrPull + Managed HSM Crypto User.
-- **Confidential ACI group** — the SEV-SNP enclave; **private IP only, no public IP**.
-
-Secrets (ACR password, TLS cert/key) are passed as `securestring` deployment
-parameters rather than Key Vault references, because org policy
-`KeyVault_PublicNetwork_Modify` forces the standard Key Vault to private-only.
-
-### External Azure services (referenced, not deployed)
-
-- **Microsoft Azure Attestation (MAA)** — verifies SEV-SNP; gates SKR. Public
-  service (no private endpoint) — reached via the NAT gateway.
-- **Microsoft Entra ID** — issues/validates caller tokens (production auth).
-- **CCE policy** — generated by `az confcom acipolicygen`; pins the exact image/entrypoint.
-
-### MCP tools exposed by the server
-
-- **Sessions:** `create_session`, `list_sessions`, `delete_session`
-- **Per-session:** `write_file`, `read_file`, `list_dir`, `run_python`, `pip_install`,
-  `run_command`, `run_tests`, `git_clone`
+- **Sessions:** `create_session`, `get_session_status`, `list_sessions`, `delete_session`
+- **Files:** `write_file`, `read_file`, `list_dir`, `upload_file`, `download_file`
+- **Execution:** `run_python`, `run_command`, `run_tests` (`pip_install` and `git_clone` exist but fail: workers have no egress)
 - **Attestation:** `get_attestation`
+
+## Azure resources
+
+- **VNet** `vnet-fabric-foundry` (192.168.0.0/16), shared; VPN gateway and DNS Private Resolver (192.168.1.36) for access and name resolution.
+- **`snet-pool-control`** (192.168.5.0/27): internal Container Apps environment with `pool-gateway` and `pool-controller`.
+- **`snet-pool-workers`** (192.168.6.0/24): delegated to `Microsoft.ContainerInstance/containerGroups`; one confidential group per session, private IP only. NSG `nsg-pool-workers` allows only the control subnet to reach TCP 8000 and denies worker-to-worker and worker-to-control traffic.
+- **NAT gateway** `natgw-aci` + `pip-aci-nat`: egress-only path to MAA and ACR, which have no private path. It is not an egress allowlist.
+- **Table storage** `poolstate`: leases and worker state; Entra-only, private endpoint, one partition so leasing can use transactions.
+- **Identities:** `id-pool-gateway`, `id-pool-controller`, and the pull-only `id-pool-acrpull` (AcrPull on the registry only).
+- **ACR** `acrconfmcpvisdzn`: worker image, pinned by digest in the CCE policy.
+- **Private DNS:** `workers.pool.internal` (worker records) and the Container Apps environment zone.
+
+## Authentication and attestation
+
+- **Callers → gateway:** Entra access token (API app audience, role `Sandbox.Access`); ownership comes from validated claims.
+- **Gateway → worker:** mutual TLS; workers hold a unique server cert, only the gateway-client issuer is trusted, and the CA signing key never enters a worker.
+- **Worker → controller:** MAA attestation, bound to the worker's TLS key and a fresh challenge; the controller verifies the approved CCE policy and SVN minimums before any data is sent.
+- **No HSM:** nothing is released to workers. See [Why no HSM](isolated-session-pool.md#why-no-hsm).

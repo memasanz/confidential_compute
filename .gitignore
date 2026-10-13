@@ -40,10 +40,6 @@ infra/tls/
 # ---- Azure ----
 .azure/
 
-# Deployment parameter/template files (contain subscription/tenant IDs, endpoints)
-infra/*.json
-!infra/*.example.json
-
 # ---- Docker ----
 *.log
 
@@ -52,3 +48,6 @@ infra/*.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Generated pool infra outputs
+infra/pool/out/
