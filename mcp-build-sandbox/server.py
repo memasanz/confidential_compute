@@ -99,6 +99,7 @@ def _ensure_session(session_id: str) -> Path:
     if not python.exists():
         session_dir.mkdir(parents=True, exist_ok=True)
         venv.create(session_dir / ".venv", with_pip=True, system_site_packages=True)
+        _own_tree(session_dir)
     return session_dir
 
 
@@ -110,19 +111,69 @@ def _safe_path(session_dir: Path, path: str) -> Path:
     return resolved
 
 
+def _child_env(cwd: Path) -> dict[str, str]:
+    """Minimal environment for generated code: no TLS keys, tokens or worker config."""
+    return {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": str(cwd), "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"}
+
+
+SANDBOX_UID = int(os.environ.get("SANDBOX_UID", "10001"))
+MAX_WORKSPACE_BYTES = int(os.environ.get("SANDBOX_MAX_WORKSPACE_BYTES", str(2 * 2**30)))
+
+
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _own(*paths: Path) -> None:
+    """Give paths to the sandbox user so generated code can use them (no-op unless root)."""
+    if _is_root():
+        for path in paths:
+            os.chown(path, SANDBOX_UID, SANDBOX_UID, follow_symlinks=False)
+
+
+def _own_tree(root: Path) -> None:
+    _own(root, *root.rglob("*"))
+
+
+def _check_disk(session_dir: Path) -> None:
+    """Fail when the workspace exceeds its size cap (the workspace is memory-backed in the TEE)."""
+    total = sum(p.stat().st_size for p in session_dir.rglob("*") if p.is_file() and not p.is_symlink())
+    if total > MAX_WORKSPACE_BYTES:
+        raise ValueError("Workspace size limit exceeded")
+
+
+def _limit_child() -> None:
+    """Applied in the child before exec (Linux only): drop root, bound memory, processes, file size."""
+    import resource
+    if _is_root():
+        os.setgroups([])
+        os.setgid(SANDBOX_UID)
+        os.setuid(SANDBOX_UID)
+    resource.setrlimit(resource.RLIMIT_AS, (3 * 2**30, 3 * 2**30))
+    resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (512 * 2**20, 512 * 2**20))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.setsid()
+
+
 def _run(args: list[str], cwd: Path, timeout: int) -> str:
     """Run a command and return combined output."""
     result = subprocess.run(
-        args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+        args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+        env=_child_env(cwd), preexec_fn=_limit_child if os.name == "posix" else None,
     )
+    _check_disk(cwd)
     return f"$ {' '.join(args)}\n(exit {result.returncode})\n{result.stdout}{result.stderr}"
 
 
 def _run_shell(command: str, cwd: Path, timeout: int) -> str:
     """Run a command through the system shell and return combined output."""
     result = subprocess.run(
-        command, cwd=str(cwd), shell=True, capture_output=True, text=True, timeout=timeout
+        command, cwd=str(cwd), shell=True, capture_output=True, text=True, timeout=timeout,
+        env=_child_env(cwd), preexec_fn=_limit_child if os.name == "posix" else None,
     )
+    _check_disk(cwd)
     return f"$ {command}\n(exit {result.returncode})\n{result.stdout}{result.stderr}"
 
 
@@ -169,6 +220,8 @@ def write_file(session_id: str, path: str, content: str) -> str:
     target = _safe_path(session_dir, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
+    _own(*[p for p in (target, *target.parents) if p == session_dir or session_dir in p.parents])
+    _check_disk(session_dir)
     return f"Wrote {len(content)} bytes to {path}"
 
 
@@ -177,6 +230,17 @@ def read_file(session_id: str, path: str) -> str:
     """Read a file from the session workspace."""
     session_dir = _require_owned(session_id)
     return _safe_path(session_dir, path).read_text(encoding="utf-8")
+
+
+@mcp.tool()
+def delete_file(session_id: str, path: str) -> str:
+    """Delete a file from the session workspace."""
+    session_dir = _require_owned(session_id)
+    target = _safe_path(session_dir, path)
+    if target == session_dir or not target.is_file():
+        raise ValueError(f"'{path}' is not a file in the session")
+    target.unlink()
+    return f"Deleted {path}"
 
 
 @mcp.tool()
@@ -205,6 +269,8 @@ def upload_file(session_id: str, path: str, content_base64: str) -> str:
     target.parent.mkdir(parents=True, exist_ok=True)
     data = base64.b64decode(content_base64)
     target.write_bytes(data)
+    _own(*[p for p in (target, *target.parents) if p == session_dir or session_dir in p.parents])
+    _check_disk(session_dir)
     return f"Uploaded {len(data)} bytes to {path}"
 
 
@@ -262,6 +328,13 @@ def git_clone(session_id: str, repo_url: str, directory: str = "repo") -> str:
     if dest.exists():
         shutil.rmtree(dest)
     return _run(["git", "clone", "--depth", "1", repo_url, str(dest)], session_dir, 300)
+
+
+@mcp.tool()
+def get_status() -> str:
+    """Report the worker lifecycle state only; no session content."""
+    _require_gateway()
+    return pool.require(active=False)
 
 
 # --- attestation --------------------------------------------------------------
@@ -348,7 +421,11 @@ def transport_options():
 
 
 if __name__ == "__main__":
+    # Content-free logs: tool errors can embed paths, file bytes or output, so only
+    # critical failures and no per-request lines reach the container log.
+    import logging
+    logging.getLogger("mcp").setLevel(logging.CRITICAL)
     options = transport_options()
     app = mcp.streamable_http_app()
     app.add_middleware(GatewayAuthMiddleware)
-    uvicorn.run(app, host=HOST, port=PORT, **options)
+    uvicorn.run(app, host=HOST, port=PORT, access_log=False, log_level="critical", **options)

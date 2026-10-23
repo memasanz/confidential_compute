@@ -1,42 +1,97 @@
 # Shared infrastructure for the confidential per-session worker pool. Idempotent, staged, no secrets.
 # Gateway/controller apps are NOT deployed here. Generated outputs go to infra\pool\out\ (git-ignored).
 #
-#   .\deploy-pool-infra.ps1 -Stage preflight
-#   .\deploy-pool-infra.ps1 -Stage network -WhatIfOnly     # what-if only
-#   .\deploy-pool-infra.ps1 -Stage network                 # what-if, then deploy
+# Supply explicit subscription, region and stage-specific existing-resource/network inputs.
+# -WhatIfOnly previews the selected stage without deploying.
 # Stages in order: preflight, network, identity, state, dns, rbac, environment
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidateSet('preflight', 'network', 'identity', 'state', 'dns', 'rbac', 'environment')]
     [string]$Stage,
     [switch]$WhatIfOnly,
-    [string]$Subscription = '7ee2b43a-eaea-4259-be7b-c8c220bfbcf9',
-    [string]$Location = 'eastus2',
-    [string]$VnetRg = 'rg-fabric-foundry-eus2',
-    [string]$VnetName = 'vnet-fabric-foundry',
-    [string]$PeSubnetName = 'snet-pe2',
+    [string]$Subscription,
+    [string]$Location,
+    [string]$VnetRg,
+    [string]$VnetName,
+    [string]$PeSubnetName,
     [string]$ControlRg = 'rg-confidential-pool-control',
     [string]$WorkerRg = 'rg-confidential-pool',
     [string]$ControlSubnetName = 'snet-pool-control',
-    [string]$ControlCidr = '192.168.5.0/27',
+    [string]$ControlCidr,
     [string]$WorkerSubnetName = 'snet-pool-workers',
-    [string]$WorkerCidr = '192.168.6.0/24',
+    [string]$WorkerCidr,
+    [string]$VnetCidr,
     [string]$WorkerPort = '8000',
-    [string]$AcrRg = 'rg-confidential-mcp',
-    [string]$AcrName = 'acrconfmcpvisdzn',
-    [string]$DnsResolverIp = '192.168.1.36',
+    [string]$AcrRg,
+    [string]$AcrName,
+    [string]$DnsResolverIp,
     [string]$WorkerZone = 'workers.pool.internal',
-    [string]$NatGatewayId = "/subscriptions/7ee2b43a-eaea-4259-be7b-c8c220bfbcf9/resourceGroups/rg-confidential-mcp/providers/Microsoft.Network/natGateways/natgw-aci",
-    [bool]$AttachNat = $true,
-    [bool]$AllowImagePullEgress = $true,
-    [string]$LogWorkspaceName = 'law-tracing-fsnn',
-    [string]$LogWorkspaceRg = 'rg-fabric-foundry-eus2'
+    [string]$NatGatewayId,
+    [bool]$AttachNat = $false,
+    [bool]$AllowImagePullEgress = $false,
+    [string]$LogWorkspaceName,
+    [string]$LogWorkspaceRg,
+    [string]$EnvName = 'cae-confidential-pool'
 )
 $ErrorActionPreference = 'Stop'
+
+function Require-Inputs([string[]]$Names) {
+    foreach ($name in $Names) {
+        if ([string]::IsNullOrWhiteSpace((Get-Variable -Name $name -ValueOnly))) {
+            throw "Stage '$Stage' requires explicit -$name"
+        }
+    }
+}
+
+function Assert-Cidr([string]$Name) {
+    $value = Get-Variable -Name $Name -ValueOnly
+    $parts = $value.Split('/')
+    $ip = $null
+    if ($parts.Count -ne 2 -or $parts[0] -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
+        -not [System.Net.IPAddress]::TryParse($parts[0], [ref]$ip) -or
+        $parts[1] -notmatch '^(?:[0-9]|[12][0-9]|3[0-2])$') {
+        throw "-$Name must be an IPv4 network CIDR"
+    }
+    $bytes = $ip.GetAddressBytes()
+    $address = [uint64]$bytes[0] * 16777216 + [uint64]$bytes[1] * 65536 + [uint64]$bytes[2] * 256 + $bytes[3]
+    if ($address % [math]::Pow(2, 32 - [int]$parts[1]) -ne 0) {
+        throw "-$Name must use a network address, not host bits"
+    }
+}
+
+Require-Inputs @('Subscription')
+if ($Subscription -notmatch '^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') {
+    throw '-Subscription must be a subscription GUID'
+}
+if ($Stage -in @('preflight', 'network', 'identity', 'state', 'environment')) { Require-Inputs @('Location') }
+if ($Stage -in @('preflight', 'network', 'state', 'dns', 'rbac', 'environment')) { Require-Inputs @('VnetRg', 'VnetName') }
+if ($Stage -in @('preflight', 'network')) {
+    Require-Inputs @('ControlCidr', 'WorkerCidr')
+    Assert-Cidr 'ControlCidr'
+    Assert-Cidr 'WorkerCidr'
+}
+if ($Stage -eq 'network') {
+    Require-Inputs @('VnetCidr', 'DnsResolverIp')
+    Assert-Cidr 'VnetCidr'
+    $resolver = $null
+    if ($DnsResolverIp -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
+        -not [System.Net.IPAddress]::TryParse($DnsResolverIp, [ref]$resolver)) {
+        throw '-DnsResolverIp must be an IPv4 address'
+    }
+    if ($AttachNat) {
+        Require-Inputs @('NatGatewayId')
+        if ($NatGatewayId -notmatch '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.Network/natGateways/[^/]+$') {
+            throw '-NatGatewayId must be a NAT gateway resource ID'
+        }
+    }
+}
+if ($Stage -eq 'state') { Require-Inputs @('PeSubnetName') }
+if ($Stage -eq 'rbac') { Require-Inputs @('AcrRg', 'AcrName') }
+if ($Stage -eq 'environment') { Require-Inputs @('LogWorkspaceName', 'LogWorkspaceRg') }
+
 $here = $PSScriptRoot
 $out = Join-Path $here 'out'
 New-Item -ItemType Directory -Force $out | Out-Null
-az account set --subscription $Subscription
 
 $vnetId = "/subscriptions/$Subscription/resourceGroups/$VnetRg/providers/Microsoft.Network/virtualNetworks/$VnetName"
 $workerSubnetId = "$vnetId/subnets/$WorkerSubnetName"
@@ -52,6 +107,8 @@ function Invoke-Az {
     if ($LASTEXITCODE -ne 0) { throw "az $($args -join ' ') failed" }
     $r
 }
+
+Invoke-Az account set --subscription $Subscription
 
 function Ensure-Rg($name) {
     if ((az group exists -n $name) -ne 'true') {
@@ -103,7 +160,7 @@ switch ($Stage) {
     }
     'network' {
         Ensure-Rg $ControlRg
-        $nsg = Deploy-Bicep $ControlRg 'pool-nsg' 'nsg.bicep' @("controlCidr=$ControlCidr", "workerCidr=$WorkerCidr", "workerPort=$WorkerPort", "dnsResolverIp=$DnsResolverIp", "allowImagePullEgress=$($AllowImagePullEgress.ToString().ToLower())")
+        $nsg = Deploy-Bicep $ControlRg 'pool-nsg' 'nsg.bicep' @("location=$Location", "controlCidr=$ControlCidr", "workerCidr=$WorkerCidr", "vnetCidr=$VnetCidr", "workerPort=$WorkerPort", "dnsResolverIp=$DnsResolverIp", "allowImagePullEgress=$($AllowImagePullEgress.ToString().ToLower())")
         $nsgId = "/subscriptions/$Subscription/resourceGroups/$ControlRg/providers/Microsoft.Network/networkSecurityGroups/nsg-pool-workers"
         if ($WhatIfOnly) {
             Write-Host "[what-if] would create subnet $ControlSubnetName $ControlCidr (delegation Microsoft.App/environments)"
@@ -123,11 +180,11 @@ switch ($Stage) {
     'identity' {
         Ensure-Rg $ControlRg
         Ensure-Rg $WorkerRg
-        $null = Deploy-Bicep $ControlRg 'pool-identities' 'identities.bicep' @()
+        $null = Deploy-Bicep $ControlRg 'pool-identities' 'identities.bicep' @("location=$Location")
     }
     'state' {
         Ensure-Rg $ControlRg
-        $null = Deploy-Bicep $ControlRg 'pool-state' 'state.bicep' @("storageName=$storageName", "tableName=$tableName", "vnetId=$vnetId", "peSubnetId=$peSubnetId")
+        $null = Deploy-Bicep $ControlRg 'pool-state' 'state.bicep' @("location=$Location", "storageName=$storageName", "tableName=$tableName", "vnetId=$vnetId", "peSubnetId=$peSubnetId")
     }
     'dns' {
         Ensure-Rg $ControlRg
@@ -152,7 +209,7 @@ switch ($Stage) {
     }
     'environment' {
         Ensure-Rg $ControlRg
-        $r = Deploy-Bicep $ControlRg 'pool-environment' 'environment.bicep' @("infraSubnetId=$controlSubnetId", "logWorkspaceName=$LogWorkspaceName", "logWorkspaceRg=$LogWorkspaceRg")
+        $r = Deploy-Bicep $ControlRg 'pool-environment' 'environment.bicep' @("location=$Location", "name=$EnvName", "infraSubnetId=$controlSubnetId", "logWorkspaceName=$LogWorkspaceName", "logWorkspaceRg=$LogWorkspaceRg")
         if ($r) { $r.properties.outputs | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'environment.json') }
     }
 }

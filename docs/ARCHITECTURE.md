@@ -1,89 +1,124 @@
 # Architecture
 
-**Architecture:** [Confidential analysis session pool](isolated-session-pool.md)
-(decisions, trust boundaries, rollout gates). Pricing is in
-[pool cost estimates](session-pool-costs.md); onboarding is in
-[getting started](getting-started.md) and the [pilot guide](pilot-guide.md).
+An on-premises agent uses Microsoft Foundry for inference and a private MCP
+gateway for tool execution. Each session runs in a separate **confidential ACI
+group (AMD SEV-SNP)**, containing a worker and an attestation sidecar. There is
+no Foundry hosted agent or Foundry built-in code interpreter in this path.
 
-A confidential code-interpreter that an AI agent drives over **MCP**. The agent
-stays outside. Each analysis session runs in its **own Azure Container Instances
-confidential container group** (AMD SEV-SNP TEE), so work is memory-encrypted,
-hidden from the host/operator, and provable via attestation. A single private
-**gateway** authenticates callers with Entra and routes each session to its
-worker; a **controller** keeps a bounded pool of ready workers and destroys each
-one after use.
+![Architecture and trust boundaries](images/architecture.svg)
 
-## Diagram
+[Editable Excalidraw source](images/architecture.excalidraw).
+Resource names below describe roles, not a particular deployed environment.
 
 ```mermaid
 flowchart LR
-    Agent["AI agent / MCP client<br/>(VPN or in-VNet)"]
+    Agent["On-premises Agent Framework / Jupyter"]
     Entra["Microsoft Entra ID"]
-    MAA["Microsoft Azure Attestation (MAA)<br/>(public, reached via NAT)"]
-
-    subgraph VNet["vnet-fabric-foundry, 192.168.0.0/16"]
-        subgraph Control["snet-pool-control 192.168.5.0/27 (internal Container Apps env)"]
-            GW["pool-gateway<br/>Entra auth, ownership, tool routing"]
-            CTL["pool-controller<br/>provision, verify attestation,<br/>replenish, retire, reconcile"]
+    Foundry["Foundry model inference<br/>outside the TEE"]
+    MAA["Microsoft Azure Attestation"]
+    ACR["Digest-pinned image registry"]
+    subgraph Private["Private VNet"]
+        subgraph Control["Internal Container Apps - trusted control plane, not confidential"]
+            GW["MCP gateway<br/>Entra authorization / ownership"]
+            CTL["Pool controller<br/>provision / verify / retire"]
         end
-        Table[("Table poolstate<br/>(private endpoint, Entra only)")]
-        subgraph Workers["snet-pool-workers 192.168.6.0/24 (NSG nsg-pool-workers)"]
-            W1["Confidential group A<br/>mcp-server + attestation sidecar"]
-            W2["Confidential group B<br/>mcp-server + attestation sidecar"]
+        State[("Private Table lease store")]
+        Material[("Controller-held PKI material<br/>issuer keys kept outside workers")]
+        subgraph Workers["Dedicated worker subnet - restrictive NSG"]
+            W1["Confidential group A<br/>worker + attestation sidecar<br/>one lifetime session"]
+            W2["Confidential group B<br/>worker + attestation sidecar<br/>one lifetime session"]
         end
-        NAT["NAT gateway natgw-aci<br/>+ pip-aci-nat (egress only)"]
     end
-    ACR["ACR acrconfmcpvisdzn"]
-
-    Agent -- "MCP over HTTPS + Entra token" --> GW
-    Agent -. "validate token" .-> Entra
-    GW <--> Table
-    CTL <--> Table
-    GW -- "mutual TLS" --> W1
-    GW -- "mutual TLS" --> W2
-    CTL -- "create / delete groups" --> Workers
-    W1 -- "attestation (outbound)" --> NAT
-    NAT --> MAA
-    CTL -. "verify MAA token + policy" .-> MAA
-    Workers -- "image pull (pull-only identity)" --> ACR
+    Agent -->|"separate token acquisitions"| Entra
+    Agent <-->|"inference + selected tool summaries"| Foundry
+    Agent -->|"VPN / private routing<br/>HTTPS MCP + sandbox bearer token"| GW
+    GW <--> State
+    CTL <--> State
+    CTL --> Material
+    GW -->|"mutual TLS"| W1
+    GW -->|"mutual TLS"| W2
+    CTL -->|"Azure management API: create / delete"| Workers
+    CTL -.->|"verify MAA token, approved policy and TLS-key binding"| MAA
+    Workers -->|"restricted egress via NAT: attestation"| MAA
+    Workers -->|"image pull: pull-only identity"| ACR
 ```
 
-The **TEE** protects each worker's memory from the infrastructure host. Code
-inside a worker, and the gateway/controller/PKI administrators, remain trusted.
-The gateway and controller are ordinary Container Apps, not confidential.
+## Request lifecycle
 
-## Components
+1. Trusted on-premises code obtains an Entra token for the sandbox API and calls
+   `create_session`. The gateway records a lease owned by that principal.
+2. The controller assigns a verified ready worker, or provisions a new worker
+   within the total cap. The client polls `get_session_status`; queued is not ready.
+3. The controller verifies fresh MAA evidence, approved CCE policy and security
+   versions, bound to the worker TLS key, before admission.
+4. Local code uploads the synthetic file. Agent tool closures bind this lease
+   and submit code over MCP; the model cannot supply a worker URL or lease ID.
+5. The gateway checks ownership/lease validity on every dispatch and uses mutual
+   TLS to the worker. The model receives only the tool output returned by local code.
+6. Local code downloads and validates the artifact, then releases the lease in
+   `finally`. The controller destroys the used group; it is never recycled.
 
-| Component | Location | Role |
+A request with unknown execution outcome is not replayed. A queued/expired
+session or missing artifact is an error, not a success-shaped fallback.
+
+## Authentication is not attestation
+
+| Path | Credential / trust | Purpose |
 |---|---|---|
-| Worker (MCP server) | `mcp-build-sandbox\server.py`, `pool_worker.py` | FastMCP app serving exactly one lifetime session over mutual TLS; file and code-execution tools; `get_attestation` |
-| Worker image | `mcp-build-sandbox\Dockerfile` | Python/pandas toolchain + worker |
-| Attestation sidecar | `mcr.microsoft.com/aci/skr` | Produces SNP/MAA evidence at `localhost:8080`; used only for attestation, no key release |
-| Gateway / controller | `pool-control\` | Entra-authenticated gateway, lease store access, controller, Azure adapter, PKI material |
-| Pool infrastructure | `infra\pool\` | Bicep + scripts: subnets, NSG, identities, Table, DNS, environment, policy generation |
-| Client examples | `examples\` | `pooled_analysis.py`, `pin_gateway_cert.py`, `pool_feasibility.py` |
+| On-premises -> gateway | Entra token for `api://<sandbox-api-id>/.default`, role `Sandbox.Access`; pinned HTTPS certificate | Caller authorization and private encrypted ingress |
+| On-premises -> Foundry | Separate `DefaultAzureCredential`, Foundry/model permissions | Inference; never reuse the sandbox token |
+| Gateway -> worker | Per-worker TLS server certificate, gateway client certificate | Mutual endpoint authentication |
+| Controller <- worker evidence | MAA signature, nonce/TLS binding, policy hash, minimum SVN | Admission of approved confidential worker |
+| Controller -> Azure resources | Narrowly scoped managed identity | Provisioning, reconciliation, DNS and state |
 
-### MCP tools
+The gateway validates Entra tenant, issuer, signature, audience, validity and
+permissions. Ownership comes from token claims. One shared application identity
+does **not** establish separate human owners. VPN access only supplies a route.
 
-- **Sessions:** `create_session`, `get_session_status`, `list_sessions`, `delete_session`
-- **Files:** `write_file`, `read_file`, `list_dir`, `upload_file`, `download_file`
-- **Execution:** `run_python`, `run_command`, `run_tests` (`pip_install` and `git_clone` exist but fail: workers have no egress)
-- **Attestation:** `get_attestation`
+## Confidential and trusted boundaries
 
-## Azure resources
+The **worker group** is the confidential boundary, not an individual process or
+directory. Separate groups isolate separate analyses. The TEE protects memory
+from the infrastructure host; code in the worker and authorized recipients still
+see their data. Generated code runs as an unprivileged user with a scrubbed
+environment and resource limits, which is hardening rather than a hostile-code
+guarantee. See the README's administrator trust model for the accepted boundary.
 
-- **VNet** `vnet-fabric-foundry` (192.168.0.0/16), shared; VPN gateway and DNS Private Resolver (192.168.1.36) for access and name resolution.
-- **`snet-pool-control`** (192.168.5.0/27): internal Container Apps environment with `pool-gateway` and `pool-controller`.
-- **`snet-pool-workers`** (192.168.6.0/24): delegated to `Microsoft.ContainerInstance/containerGroups`; one confidential group per session, private IP only. NSG `nsg-pool-workers` allows only the control subnet to reach TCP 8000 and denies worker-to-worker and worker-to-control traffic.
-- **NAT gateway** `natgw-aci` + `pip-aci-nat`: egress-only path to MAA and ACR, which have no private path. It is not an egress allowlist.
-- **Table storage** `poolstate`: leases and worker state; Entra-only, private endpoint, one partition so leasing can use transactions.
-- **Identities:** `id-pool-gateway`, `id-pool-controller`, and the pull-only `id-pool-acrpull` (AcrPull on the registry only).
-- **ACR** `acrconfmcpvisdzn`: worker image, pinned by digest in the CCE policy.
-- **Private DNS:** `workers.pool.internal` (worker records) and the Container Apps environment zone.
+The gateway, controller, PKI administrators, on-premises runtime and Foundry model
+are outside the TEE. They are trusted for the data they handle. Returned tool
+summaries leave the confidential boundary. `store=False` is a response-storage
+setting, not a claim of zero service logging or retention.
 
-## Authentication and attestation
+## Components and networking
 
-- **Callers → gateway:** Entra access token (API app audience, role `Sandbox.Access`); ownership comes from validated claims.
-- **Gateway → worker:** mutual TLS; workers hold a unique server cert, only the gateway-client issuer is trusted, and the CA signing key never enters a worker.
-- **Worker → controller:** MAA attestation, bound to the worker's TLS key and a fresh challenge; the controller verifies the approved CCE policy and SVN minimums before any data is sent.
-- **No HSM:** nothing is released to workers. See [Why no HSM](isolated-session-pool.md#why-no-hsm).
+| Component | Implementation |
+|---|---|
+| MCP worker | `mcp-build-sandbox\server.py`, `pool_worker.py`; one lifetime session, required mTLS |
+| Attestation sidecar | `mcr.microsoft.com/aci/skr`, used for evidence only; no secret release |
+| Gateway/controller | `pool-control\`; separate identities in an internal Container Apps environment |
+| Lease store | Private Entra-only Table storage; ETags and same-partition transactions |
+| PKI | Controller-held worker issuer; gateway-held client credentials; keys materialized at runtime |
+| On-premises callers | `examples\pool_client.py`, scripts and notebooks |
+| Infrastructure | `infra\pool\`; explicit existing-network, registry and attestation inputs |
+
+Callers need VPN/ExpressRoute or equivalent routing plus private DNS. Workers
+occupy a separate delegated subnet; its NSG permits control-to-worker TCP 8000
+and denies worker-to-worker/control/state access. Only approved DNS and Azure
+service egress is permitted. NAT supplies an outbound path, **not** an allowlist.
+General-purpose package/Git egress is blocked.
+
+Images are digest-pinned by the CCE policy. Worker source changes require an
+image rebuild and approved policy regeneration. The pool uses no HSM or SKR;
+the sidecar name does not mean an SKR path is enabled.
+
+The current app template uses an ephemeral controller material volume.
+Persistent material storage is not implemented; review the configured
+secret/material lifecycle before production.
+
+## State of the implementation
+
+The small pilot was validated historically; current runtime state is unknown.
+Scale-up, reliable client connectivity, load/failure behavior and production
+operations remain release gates. See [design](isolated-session-pool.md),
+[setup](getting-started.md), [operations](pilot-guide.md) and
+[cost assumptions](session-pool-costs.md).

@@ -16,8 +16,13 @@ RUN pip install --no-cache-dir pandas openpyxl pytest
 COPY server.py .
 COPY pool_worker.py .
 
+# Generated code runs as this unprivileged user; the server (root) keeps /app and its
+# environment unreadable to it.
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin sandbox \
+    && chmod -R go-rwx /app
+
 # Ephemeral per-run workspace for agent code.
-RUN mkdir -p /workspace
+RUN mkdir -p /workspace && chmod 755 /workspace
 ENV SANDBOX_WORKSPACE=/workspace \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=8000 \

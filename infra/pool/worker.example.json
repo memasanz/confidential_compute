@@ -23,7 +23,7 @@
       "confidentialComputeProperties": {"ccePolicy": ""},
       "sku": "Confidential",
       "osType": "Linux",
-      "restartPolicy": "Always",
+      "restartPolicy": "Never",
       "subnetIds": [{"id": "[parameters('subnetId')]"}],
       "containers": [{
         "name": "mcp-server",

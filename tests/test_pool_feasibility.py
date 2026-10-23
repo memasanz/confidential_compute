@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "mcp-build-sandbox"))
 sys.path.insert(0, str(ROOT / "infra" / "pool"))
 from pool_worker import LifetimeSession, canonical_challenge, public_key_hash, validate_tls, verify_maa_token
-from prepare import issue, pem, prepare
+from make_pki import issue, pem, write_private
 from finalize_policy import finalize
 
 
@@ -272,6 +272,59 @@ def test_real_uvicorn_mtls_mcp_lifecycle(monkeypatch, local, pki, hostile_loopba
     assert not thread.is_alive()
 
 
+def test_generated_code_cannot_see_worker_secrets(monkeypatch, local):
+    worker = load_server(monkeypatch, local)
+    monkeypatch.setenv("MCP_TLS_KEY", "secret-key")
+    monkeypatch.setenv("SOME_TOKEN", "secret-token")
+    env = worker._child_env(local)
+    assert set(env) == {"PATH", "HOME", "LANG", "PYTHONUNBUFFERED"}
+    assert "secret" not in "".join(env.values())
+
+
+def test_delete_file_and_status(monkeypatch, local):
+    worker = load_server(monkeypatch, local)
+    worker.create_session("session-a")
+    worker.write_file("session-a", "x.txt", "x")
+    assert "Deleted" in worker.delete_file("session-a", "x.txt")
+    with pytest.raises(ValueError):
+        worker.delete_file("session-a", "x.txt")
+    with pytest.raises(ValueError):
+        worker.delete_file("session-a", "../escape")
+    assert worker.get_status() == "active"
+
+
+def test_worker_never_restarts():
+    template = json.loads((ROOT / "infra" / "pool" / "worker.example.json").read_text())
+    assert '"restartPolicy": "Never"' in json.dumps(template)
+
+
+def test_orphan_cleanup_selects_only_old_groups_of_this_pool():
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace as NS
+    from orphan_cleanup import expired_groups
+
+    now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+
+    def group(name, pool, age_minutes):
+        start = None if age_minutes is None else now - timedelta(minutes=age_minutes)
+        container = NS(instance_view=NS(current_state=NS(start_time=start)))
+        return NS(name=name, tags={"pool-control": pool}, containers=[container])
+
+    groups = [group("old", "p", 300), group("young", "p", 10),
+              group("other-pool", "q", 300), group("not-started", "p", None)]
+    result = expired_groups(groups, "p", now, timedelta(minutes=120))
+    assert [g.name for g in result] == ["old"]
+
+
+def test_workspace_size_cap(monkeypatch, local):
+    worker = load_server(monkeypatch, local)
+    monkeypatch.setattr(worker, "MAX_WORKSPACE_BYTES", 10)
+    worker.create_session("session-a")
+    worker.write_file("session-a", "small.txt", "x")
+    with pytest.raises(ValueError, match="size limit"):
+        worker.write_file("session-a", "big.txt", "x" * 100)
+
+
 def test_non_pooled_mode_rejected(monkeypatch, local):
     monkeypatch.setenv("SANDBOX_WORKSPACE", str(local))
     monkeypatch.setenv("MCP_WORKER_MODE", "legacy")
@@ -331,13 +384,24 @@ def test_signed_claim_verifier_is_not_live_attestation():
                          challenge + b" ", "b" * 64, minima, now)
 
 
-def test_prepare_and_finalize_are_local_only(local):
-    output = local / "prepared"
-    manifest = prepare(output, ["a.example.test", "b.example.test"], "registry/image@sha256:" + "a" * 64)
-    assert len(manifest["workers"]) == 2
-    assert public_key_hash((output / "worker-1.pem").read_bytes()) != public_key_hash((output / "worker-2.pem").read_bytes())
-    template = json.loads((output / "worker-1.json").read_text())
-    params = json.loads((output / "worker-1.parameters.json").read_text())
+def test_pki_private_files_refuse_overwrites(local):
+    key, cert = pem(issue("test-ca"))
+    path = local / "test-ca.key"
+    write_private(path, key)
+    with pytest.raises(FileExistsError):
+        write_private(path, cert)
+    assert path.read_text() == key
+
+
+def test_finalize_is_local_only():
+    template = json.loads((ROOT / "infra" / "pool" / "worker.example.json").read_text())
+    _, client_ca = pem(issue("test-client-ca"))
+    params = {"parameters": {name: {"value": value} for name, value in {
+        "workerId": "worker-a", "sessionId": "session-a",
+        "workerHostname": "a.example.test", "clientCa": client_ca,
+        "maaEndpoint": "maa.example.test",
+        "tlsCert": "offline-test-certificate", "tlsKey": "offline-test-key",
+    }.items()}}
     assert "identity" not in template["resources"][0]
     assert "imageRegistryCredentials" not in template["resources"][0]["properties"]
     assert not any("registry" in key.lower() or "auth" in key.lower() for key in params["parameters"])

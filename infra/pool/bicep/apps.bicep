@@ -1,6 +1,6 @@
 // Pool gateway (internal ingress, Entra-validated MCP endpoint) and controller (no ingress) apps.
 // Separate user-assigned identities. The attached pull identity has AcrPull only. Only the controller
-// mounts the material share and receives the worker-server CA private key.
+// mounts the ephemeral material volume and receives the worker-server CA private key.
 param location string = resourceGroup().location
 param environmentName string = 'cae-confidential-pool'
 param image string

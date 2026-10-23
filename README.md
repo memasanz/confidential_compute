@@ -1,194 +1,210 @@
-# Confidential Code Sandbox (MCP)
+# Confidential code execution over MCP
 
-A **confidential code-interpreter** an AI agent drives over **MCP**. The agent
-writes files, runs Python (pandas/openpyxl preinstalled) and downloads results,
-like Azure Container Apps *dynamic sessions*, but every analysis session runs in
-its **own Azure Container Instances confidential container group** (AMD SEV-SNP
-TEE). Work is memory-encrypted, hidden from the host/operator, and provable via
-**attestation**.
+Run an AI agent **on-premises**, use **Microsoft Foundry for model inference**,
+and execute its analysis code in a dedicated **Azure confidential container**.
+The agent calls a private MCP gateway; each analysis session gets its own Azure
+Container Instances (ACI) confidential container group using **AMD SEV-SNP**.
 
-**Design:** one confidential ACI group per session, an Entra-authenticated MCP
-gateway, a Table-backed lease store, and a pool controller that keeps a bounded
-number of ready workers and destroys each worker after use. See
-[the pooled design](docs/isolated-session-pool.md),
-[architecture](docs/ARCHITECTURE.md), and [cost estimates](docs/session-pool-costs.md).
+This is real hardware-backed confidential computing, not just a private network
+or an ordinary container. A worker's memory is encrypted against infrastructure
+host access, and the controller verifies fresh attestation before admitting it.
+Workers are **destroyed after use**, never returned to the ready pool.
 
-**Scope:** the TEE protects a worker's memory from the infrastructure host. It
-does not make arbitrary code inside the worker safe, protect data after an
-authorized caller receives it, or hide data from the gateway/controller
-administrators (the control plane is not confidential). Residual risks (SMT,
-pull identity) are listed in the design doc.
+**Status: working pilot, not production-ready.** Historical live validation
+covered spreadsheet analysis and cross-owner denial. An Azure check on
+**2026-10-23** found a configured **3-worker maximum / 2-ready target** and two
+confidential worker groups with provisioning status `Succeeded`. This is a
+point-in-time infrastructure observation, not proof of session readiness or a
+new end-to-end validation. A 10-ready / 20-maximum pool remains an unvalidated
+scale target. See the
+[pilot guide and live release gate](docs/pilot-guide.md).
 
-**Status:** the pilot (3 sessions total, 2 warm workers) was validated live; the
-10-ready/20-maximum pool is not deployed. The Managed HSM, Secure Key Release and
-the earlier single-group demo were removed on 2026-10-13
-([removal decision](docs/isolated-session-pool.md#removal-decision-2026-10-13)).
+**Pool sizing:** `POOL_MAX_TOTAL` is a configurable application limit, not a
+network limit. The code permits up to **20 total workers** and a ready target
+of up to **10**, subject to Azure quota, subnet space and regional availability.
+With a 3-worker cap and 2-ready target, one active worker can coexist with two
+ready workers, but three active workers leave no ready reserve. Provisioning
+and deleting workers also count toward the cap.
 
-**Getting started:** [getting-started.md](docs/getting-started.md) (deploy and
-onboard) and the [pilot guide](docs/pilot-guide.md) (use the pilot).
+**Deployment readiness:** another team can follow the
+[deployment guide](infra/pool/README.md) to evaluate the pilot in its own existing
+Azure VNet. This is a guided setup, not a turnkey installer: shared networking,
+private routing/DNS, registry, identity and security approvals must be supplied.
+Fresh-environment acceptance, persistent controller material storage,
+certificate rotation, failure recovery, scale and startup latency still need
+production hardening.
 
-```
-  Agent / MCP client ──MCP + Entra token──▶ pool-gateway ──mutual TLS──▶ confidential ACI group (SEV-SNP)
-  (VPN or in-VNet)                          │ (Container Apps)            ├─ mcp-server (one session)
-                                            └─ Table lease store          └─ attestation sidecar
-                                  pool-controller ── create/verify/delete groups ──▶ worker pool
-```
+## How it works
 
-## Overview (plain language)
+Think of this as a **confidential code interpreter for an on-premises AI agent**.
+For example, when you ask the agent to analyze a spreadsheet:
 
-AI agents sometimes need to write and run code, and if it touches sensitive data
-the worry is who else can see it while it runs. This project gives each analysis a
-**hardware-protected room** whose memory is encrypted against infrastructure-host
-access and which can show hardware-signed evidence about its configuration.
-Authorized callers and code already inside the room are still trusted.
+1. **The agent calls a Foundry model** to decide what analysis/code to run.
+   The agent loop itself stays on-premises.
+2. **Local code authenticates to the private MCP gateway** using Entra and
+   requests an analysis session.
+3. **The pool assigns a dedicated confidential worker.** Its memory is
+   protected using AMD SEV-SNP; the controller verifies attestation before
+   admitting the worker.
+4. **The spreadsheet is uploaded and Python runs in that worker.** Analysis
+   summaries can return to the model; local code downloads the resulting files.
+5. **The session is released and its worker is destroyed.** A used worker is
+   never handed to another session. The controller provisions fresh replacements
+   as needed to restore the ready target within the total cap.
 
-- **The locked kitchen** = a CPU feature (a *TEE*) that seals the room; memory is
-  encrypted by the hardware.
-- **A certificate of authenticity** = *attestation*. Before data goes in, the room
-  presents a CPU-signed report proving it is the real sealed environment running
-  the approved image.
-- **One kitchen per order** = each session gets its own worker group, destroyed
-  afterwards; a used worker is never reused.
-- **The chef stays outside** = the agent never enters; it passes requests through
-  the gateway and gets results back.
+A session can acquire an already-running, unused warm worker; it does not
+necessarily wait for a new group to be provisioned. That worker belongs to
+one session for its lifetime, across multiple code executions and tool calls.
+Additional requests queue when no worker is ready.
 
-**Two trust checks, opposite directions:** the caller proves *who it is* with an
-Entra token (**authentication**), and the worker proves *it is genuine* with a
-hardware-signed report (**attestation**).
+**Only worker execution is confidential.** The gateway can see routed data,
+and Foundry can see any tool results sent to the model. The entire agent/model
+workflow is not inside confidential compute.
 
-## Key terms
+## Try the examples
 
-**Enclave / TEE (Trusted Execution Environment)** — a protected region of a
-computer created and enforced by the CPU, where code and data are shielded while
-they run: memory encryption, a hardware-enforced boundary, and attestation. Here
-the enclave is the confidential container group on **AMD SEV-SNP**.
+| Example | What it demonstrates |
+|---|---|
+| [01 - MCP tools notebook](examples/01_mcp_tools.ipynb) | Discover tools, allocate a confidential session, transfer files, execute pandas, verify a downloaded CSV, release |
+| [02 - Agent Framework notebook](examples/02_agent_framework.ipynb) | A locally running agent uses a Foundry model and session-bound MCP tools |
+| [Runnable Agent Framework code](examples/agent_framework_analysis.py) | The same on-premises integration without Jupyter |
+| [Direct Python client](examples/pooled_analysis.py) | Deterministic spreadsheet analysis without a model |
 
-**Attestation** — a hardware-signed report proving the environment is genuine and
-running the approved code; verified through Microsoft Azure Attestation (MAA). The
-pool binds it to each worker's TLS key.
+The four-row `sample_sales.xlsx` is synthetic: East/West/North/South,
+revenue 120/200/150/170 and units 12/20/15/17. Examples verify totals of
+**640 revenue and 64 units**, rather than trusting a model's success claim.
 
-**CCE policy** — the confidential-container policy that pins the exact images and
-entrypoint of a worker group; its hash is part of the attestation.
+You need a deployed service, private routing (VPN/ExpressRoute or equivalent),
+working private DNS, a verified gateway certificate, and an Entra app with
+`Sandbox.Access`. The agent example also needs a Foundry project/model and
+separate inference permissions. **The notebooks do not deploy infrastructure.**
 
-## Why no HSM
-
-Workers attest to the controller via MAA with TLS-key binding, per-worker keys
-derive from the controller CA, and no secret is released to workers, so there is
-nothing for an HSM or Secure Key Release to gate. A Key Vault Premium SKR path
-could be added later if a secret must be released to attested workers. Details:
-[Why no HSM](docs/isolated-session-pool.md#why-no-hsm).
-
-## Alternatives: ACA Sandboxes and dynamic sessions
-
-**ACA Sandboxes is not dynamic sessions.** The
-[Sandboxes product](https://learn.microsoft.com/azure/container-apps/sandboxes-overview)
-provides individual isolated compute environments with prewarmed startup,
-suspend/resume, storage, networking controls, and programmable lifecycle. It is a
-strong candidate for untrusted-code isolation when confidential computing is not
-required.
-
-| Requirement | ACA Sandboxes | Confidential ACI pool (this repo) |
-|---|---|---|
-| Isolate untrusted analysis sessions | Per-sandbox compute/network boundary | Separate confidential group per analysis |
-| Confidential memory and attestation | Not established by the reviewed SandboxGroups documentation | SEV-SNP TEE and MAA/CCE attestation |
-| Prewarming and lifecycle | Platform prewarming, suspend/resume, lifecycle policies | Controller-managed ready groups; destroy used groups |
-| Custom runtime | OCI-derived disk images | Approved container images |
-| Agent endpoint | Wrap sandbox SDK operations in a trusted MCP service | Single trusted MCP gateway and pool controller |
-
-Confidential DC workload profiles for ordinary Container Apps do not establish
-that ACA Sandboxes support confidential compute. This repository selects
-confidential ACI because confidential computing is required.
-
-### Dynamic sessions comparison
-
-**This is not generally a better sandbox.** Azure Container Apps dynamic sessions
-are the stronger default for executing untrusted or LLM-generated code with
-managed, per-session isolation. This project addresses an additional requirement:
-an attested confidential-computing boundary protecting data in use from the
-infrastructure host.
-
-| Requirement | Dynamic sessions (built-in or custom container) | This confidential ACI pool |
-|---|---|---|
-| Python analysis and spreadsheet processing | Code execution plus file APIs, or your own interpreter | MCP tools for Python and file upload/download |
-| Isolation between untrusted sessions | A separate Hyper-V isolation boundary per session | A separate confidential group per session |
-| Protect data in use from the infrastructure host | Hyper-V isolation; not documented as an attested confidential TEE | AMD SEV-SNP encrypted memory with MAA attestation |
-| Startup and scaling | Prewarmed pools, allocation in milliseconds, managed scaling | Warm workers start a session in about 1 minute; a cold replacement takes about 4 minutes; scaling is this repo's controller |
-| Session lifecycle | Platform-managed idle cleanup | Idle 30 min / absolute 4 h, then the group is destroyed |
-| Networking | Outbound blocked by default; configurable | Workers have no egress by design (NAT only for MAA/ACR) |
-| Agent/MCP integration | Wrap the REST API in a trusted adapter | MCP gateway included |
-| Operations and cost | Managed service | Maintain ACI, image, policies, PKI, networking and capacity; see [costs](docs/session-pool-costs.md) |
-
-**Choose dynamic sessions** if the missing capability is custom packages, shell
-tools or fast disposable sessions and confidential computing is not required.
-**Choose confidential ACI** when protecting memory from the infrastructure host
-or verifying the workload is a hard requirement.
-
-**Neither design covers the whole agent workflow.** Uploaded data originates
-outside the execution environment and results leave it. If a model consumes tool
-results, keeping the calculation in a TEE does not keep those results out of the
-model service. TLS, egress policy, authorization, logging and retention remain
-separate responsibilities.
-
-Comparison based on Microsoft documentation reviewed on 2026-10-12:
-[dynamic sessions](https://learn.microsoft.com/azure/container-apps/sessions),
-[code interpreter](https://learn.microsoft.com/azure/container-apps/sessions-code-interpreter),
-[custom containers](https://learn.microsoft.com/azure/container-apps/sessions-custom-container),
-and [confidential ACI](https://learn.microsoft.com/azure/container-instances/container-instances-confidential-overview).
-
-## Layout
-
-| Path | Purpose |
-|------|---------|
-| `mcp-build-sandbox\server.py` | Worker FastMCP server: one lifetime session, mutual TLS, file and code-execution tools, attestation |
-| `mcp-build-sandbox\pool_worker.py` | Worker lifetime-session state machine, TLS validation, attestation challenge |
-| `mcp-build-sandbox\Dockerfile` | Python toolchain + worker image |
-| `pool-control\` | Gateway, controller, Table lease store, Azure adapter, PKI material |
-| `infra\pool\` | Pool infrastructure (Bicep, deploy scripts, policy generation, smoke test); see its README |
-| `examples\pooled_analysis.py` | Client: create session, upload a spreadsheet, run pandas, download, delete |
-| `examples\pin_gateway_cert.py` | Pin the gateway's self-signed certificate |
-| `examples\pool_feasibility.py` | Two-worker feasibility probe |
-| `examples\.env.example` | Copy to `examples\.env`; client configuration |
-| `tests\` | Worker and pool-control tests |
-
-Deployment-specific values and `.env` are git-ignored. Local checks:
+From the repository root, after creating a Python 3.11+ virtual environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests\test_pool_feasibility.py tests\test_pool_control.py
+.\.venv\Scripts\python.exe -m pip install -r examples\requirements-notebooks.txt
+Copy-Item examples\.env.example examples\.env
+# Fill in your own configuration; never commit .env or certificates.
+.\.venv\Scripts\python.exe -m jupyter lab
+# Or run without Jupyter:
+.\.venv\Scripts\python.exe examples\agent_framework_analysis.py
 ```
 
-## MCP tools
+On managed devices, use your approved package index. Complete instructions:
+[getting started](docs/getting-started.md). For an existing service:
+[pilot guide](docs/pilot-guide.md). For deployment:
+[infrastructure guide](infra/pool/README.md).
+
+## Architecture and confidential boundary
+
+![On-premises agent and confidential session pool](docs/images/architecture.svg)
+
+[Architecture details](docs/ARCHITECTURE.md) include a Mermaid diagram and
+[editable diagram source](docs/images/architecture.excalidraw).
+
+**Only worker execution is inside the TEE.** The on-premises agent, Foundry model,
+gateway, controller, and their administrators remain outside that boundary.
+Gateway/controller administrators can see routed data; a model can see tool
+results returned to it. This is **not end-to-end confidential inference** and
+does not make arbitrary code inside a worker trustworthy.
+
+| Check | What it proves |
+|---|---|
+| Entra authentication | The caller has API permission; sessions belong to its validated principal |
+| Gateway-to-worker mutual TLS | The gateway reaches the authenticated worker |
+| MAA attestation + CCE policy | The admitted worker meets the approved image/policy/security baseline, bound to its TLS key |
+
+Using one service principal for multiple people shares gateway ownership. This
+sample does not implement per-human delegated authorization.
+
+### Administrator trust model
+
+This design protects session data from the Azure host and from other sessions.
+It accepts the **narrower administrative boundary**: workload administrators
+(gateway, controller, PKI) are constrained by separately owned Azure Policy and
+RBAC, and an independent security authority controls those policies. Azure
+administrators who can change the governing policies are handled by that
+separation of duties, not by cryptography. The gateway handles plaintext by
+design. Tool results and files transit it, so its administrators must be trusted
+for the data they route. Protection against *all* Azure administrators would need
+TEE-generated keys and end-to-end encrypted payloads, which this pilot does not
+implement.
+
+### Worker hardening
+
+- Generated code runs as an unprivileged `sandbox` user with a minimal
+  environment (no TLS key, tokens or worker settings) and bounded memory,
+  process count and file size. The server keeps `/app` and its own environment
+  unreadable to that user.
+- The workspace is capped at 2 GiB. Temporary data lives on the confidential
+  container's ephemeral filesystem, which sits in encrypted TEE memory and is
+  discarded with the group; no volume is mounted. Verify this on a live worker.
+- Workers never restart (`restartPolicy: Never`); a restart retires the session
+  and a retry gets a new group and new material.
+- `infra/pool/orphan_cleanup.py` deletes worker groups past a maximum age using
+  ARM tags and start times only, independently of the controller.
+- Gateway and worker logs are content-free: no per-request lines, and tool errors
+  are not logged.
+
+## Tools and limits
 
 Sessions: `create_session`, `get_session_status`, `list_sessions`, `delete_session`.
+Files: `write_file`, `read_file`, `delete_file`, `list_dir`, `upload_file`, `download_file`.
+Execution: `run_python`, `run_command`, `run_tests`.
+Evidence and health: `get_attestation`, `get_status`.
 
-Per-session work (all take `session_id`):
-- `write_file`, `read_file`, `list_dir`
-- `upload_file`, `download_file` — binary files as base64
-- `run_python`, `run_command`, `run_tests`
-- `pip_install`, `git_clone` — exist, but fail because workers have no egress
+`pip_install` and `git_clone` exist but fail under the configured egress
+restrictions. Bake packages into an approved, digest-pinned worker image instead.
+Workers have restricted service egress for attestation/image dependencies, not
+general-purpose internet access.
 
-Attestation: `get_attestation` — signed SEV-SNP/MAA token bound to the worker's
-TLS key and a client challenge; the client must verify it.
+Historical pilot limits: 30-minute idle / 4-hour absolute lifetime, 300-second
+operation limit, 1 MiB bounds, and a 10-minute queue wait. JSON/base64 overhead
+reduces usable file size below the configured serialized request/result limits.
+Warm acquisition was about one minute and cold replacement about four minutes;
+these are historical observations, not fixed waits or latency guarantees.
+Warm acquisition includes controller scheduling, Azure management checks,
+fresh attestation and activation, plus client status polling. Attestation alone
+has not been timed separately, so it is not established as the bottleneck.
 
-## Security model
+Accepted pilot risks include SMT-enabled hosts and a pull-only registry identity
+reachable from worker code. Because that identity is attached to the worker, its
+token endpoint (the instance metadata service) is reachable from generated code; the network
+rules cannot block that link-local address. The identity holds only `AcrPull` on
+one registry (`acr-pull-only`), but this does not meet a strict "no access to
+cloud metadata or management credentials" requirement. There is no HSM or Secure Key Release path; the
+attestation sidecar's `skr` image name is historical. See the
+[design and rollout gates](docs/isolated-session-pool.md).
 
-- **Boundary:** the confidential ACI group, one per session. Directories and
-  virtualenvs inside a worker are not a security boundary; the worker serves one
-  session for its lifetime and is then destroyed.
-- **Authentication:** Entra token (API app audience, role `Sandbox.Access`) at the
-  gateway; the gateway enforces ownership and the persistent lease on every call.
-  Gateway-to-worker traffic uses mutual TLS with per-worker certificates; CA keys
-  never enter a worker.
-- **Attestation:** the controller verifies fresh MAA evidence against the approved
-  CCE policy and SVN minimums before data is allowed in.
-- **Network:** workers sit in a dedicated subnet whose NSG only admits the control
-  subnet on TCP 8000 and denies worker-to-worker and worker-to-control traffic.
-- **Free command model:** commands run as child processes of the worker, so a
-  session can run arbitrary code with the worker's permissions; isolation comes
-  from the per-session group, not from the process.
-- **Residual risks:** SMT enabled on the host, the pull-only registry identity
-  reachable from session code, gateway/controller administrators trusted.
+Live hardening check (2026-10-23, hardened worker image, via the `hostile` phase
+of `infra/pool/smoke.py`): generated code ran as a non-root user with no secret
+environment variables, could not read the server's code or environment, could
+not reach the internet, and was stopped by the process, memory and file-size
+limits; another session's files were not reachable. The metadata endpoint was
+reachable, as described above. Restart/replay and `basic` cross-owner tests have
+not yet been run live.
 
-## Deploy
+## Repository map
 
-Pool infrastructure and apps: [docs/getting-started.md](docs/getting-started.md)
-and [infra\pool\README.md](infra/pool/README.md).
+| Path | Purpose |
+|---|---|
+| `examples\` | Notebooks, on-premises agent, direct client, synthetic spreadsheet |
+| `mcp-build-sandbox\` | Single-lifetime-session worker and image |
+| `pool-control\` | MCP gateway, controller, lease store, Azure adapter, PKI material |
+| `infra\pool\` | Parameterized deployment, CCE policy generation, smoke probe |
+| `tests\` | Worker, lifecycle, client, notebook and offline integration checks |
+| `docs\` | Architecture, setup, operations, design and [cost estimates](docs/session-pool-costs.md) |
+
+Offline tests use explicit fake services; they do not demonstrate live Azure
+availability or attestation. Follow the [release gate](docs/pilot-guide.md#live-release-gate)
+before claiming a successful deployment.
+
+## When to use this
+
+Choose this design when **attested confidential memory** is a hard requirement.
+For ordinary untrusted-code execution without that requirement, evaluate managed
+[Container Apps dynamic sessions](https://learn.microsoft.com/azure/container-apps/sessions)
+or the separate [ACA Sandboxes product](https://learn.microsoft.com/azure/container-apps/sandboxes-overview).
+Neither product is substituted here or assumed to provide this SEV-SNP
+attestation guarantee. This pilot requires you to operate the pool, PKI,
+networking, capacity, and lifecycle yourself.

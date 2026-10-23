@@ -70,6 +70,7 @@ def build_mcp(gateway, verifier, resource_url, host="127.0.0.1", port=8000):
         raise ValueError("Explicit private HTTPS gateway URL required")
     mcp = FastMCP(
         "confidential-session-gateway", host=host, port=port, stateless_http=True,
+        log_level="CRITICAL",  # content-free logs: tool errors and requests may carry session data
         json_response=True, max_request_body_size=limits.upload_bytes + 65536,
         token_verifier=verifier, auth=AuthSettings(
             issuer_url=verifier.issuer, resource_server_url=resource_url,

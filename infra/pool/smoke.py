@@ -2,7 +2,7 @@
 
 Env: SMOKE_URL (https://<gateway-fqdn>/mcp), SMOKE_AUDIENCE, SMOKE_CLIENT_A, SMOKE_CLIENT_B (user-assigned
 identity client IDs holding the API app role), SMOKE_TRUST (path to PEM, or "tofu" = pin the gateway
-ingress certificate presented now and print its fingerprint), SMOKE_PHASE = basic | capacity.
+ingress certificate presented now and print its fingerprint), SMOKE_PHASE = basic | capacity | hostile (hostile runs adversarial generated code and prints only outcome labels).
 Prints JSON event lines only: never tokens, keys or file contents beyond the synthetic result.
 """
 
@@ -172,6 +172,57 @@ async def capacity(a, b):
         log("delete", session=sid[:8], result=await a.call("delete_session", session_id=sid))
 
 
+HOSTILE_PROBE = '''
+import json, os, resource, socket, subprocess, sys
+
+def attempt(fn):
+    try:
+        fn()
+        return "allowed"
+    except BaseException as error:
+        return "blocked:" + type(error).__name__
+
+def connect(host):
+    socket.create_connection((host, 80), timeout=4).close()
+
+def spawn_many():
+    kids = [subprocess.Popen(["sleep", "30"]) for _ in range(2000)]
+    for kid in kids:
+        kid.kill()
+
+def big_memory():
+    bytearray(16 * 2**30)
+
+def big_file():
+    with open("big.bin", "wb") as f:
+        f.write(b"x" * (700 * 2**20))
+
+result = {
+    "uid": os.getuid(),
+    "secret_env_names": sorted(k for k in os.environ if any(s in k.upper() for s in ("KEY", "TOKEN", "TLS", "SECRET"))),
+    "read_server_code": attempt(lambda: open("/app/server.py").read()),
+    "read_server_environ": attempt(lambda: open("/proc/1/environ").read()),
+    "metadata_service": attempt(lambda: connect("169.254.169.254")),
+    "internet": attempt(lambda: connect("example.com")),
+    "process_bomb": attempt(spawn_many),
+    "memory_bomb": attempt(big_memory),
+    "oversized_file": attempt(big_file),
+}
+print(json.dumps(result))
+'''
+
+
+async def hostile(a, b):
+    """Run hostile generated code and report only outcome labels; expect uid != 0 and every attempt blocked."""
+    error, text = await a.call("create_session")
+    sid = json.loads(text)["session_id"]
+    log("activated", status=await wait_status(a, sid, {"active", "expired", "failed"}, 400))
+    log("hostile", result=await a.call("run_python", session_id=sid, code=HOSTILE_PROBE, timeout=120))
+    # A second session must not see the first one's files.
+    log("cross_session_read", result=await a.call("read_file", session_id="not-mine", path="big.bin"))
+    log("delete", result=await a.call("delete_session", session_id=sid))
+
+
 async def main():
     if os.environ.get("SMOKE_PHASE") == "net":
         import socket
@@ -201,7 +252,7 @@ async def main():
     context = trust_context(url)
     a = Client("a", os.environ["SMOKE_CLIENT_A"], url, audience, context)
     b = Client("b", os.environ["SMOKE_CLIENT_B"], url, audience, context)
-    await {"basic": basic, "capacity": capacity}[os.environ["SMOKE_PHASE"]](a, b)
+    await {"basic": basic, "capacity": capacity, "hostile": hostile}[os.environ["SMOKE_PHASE"]](a, b)
     log("done")
 
 

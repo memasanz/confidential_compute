@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="820" viewBox="0 0 1200 820" role="img" aria-labelledby="title desc">
+  <title id="title">On-premises agent with confidential MCP execution</title>
+  <desc id="desc">An on-premises Agent Framework or Jupyter client authenticates with Entra, uses Foundry for inference, and reaches a private MCP gateway. The non-confidential gateway and controller share private state. Each execution worker is a separate SEV-SNP confidential group, reached through mutual TLS and admitted after MAA attestation.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#495057"/></marker>
+    <style>
+      text { font-family: Arial, sans-serif; fill: #000000; font-size: 16px; }
+      .title { font-size: 25px; font-weight: bold; }
+      .heading { font-size: 18px; font-weight: bold; }
+      .small { font-size: 14px; }
+      .line { stroke: #495057; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .box { stroke-width: 2; rx: 10; }
+    </style>
+  </defs>
+  <rect width="1200" height="820" fill="#ffffff"/>
+  <text x="30" y="40" class="title">On-premises agent, confidential code execution</text>
+  <text x="30" y="68">Only the worker groups are confidential. Foundry inference and the control plane are outside the TEE.</text>
+  <rect x="30" y="110" width="270" height="110" class="box" stroke="#0078D4" fill="#CFE4FA"/>
+  <text x="50" y="143" class="heading">On-premises client</text>
+  <text x="50" y="170">Agent Framework / Jupyter</text>
+  <text x="50" y="196" class="small">Trusted file transfer + lease lifecycle</text>
+  <rect x="430" y="110" width="270" height="110" class="box" stroke="#5C2D91" fill="#E8DAEF"/>
+  <text x="450" y="143" class="heading">Microsoft Foundry model</text>
+  <text x="450" y="170">Inference + selected summaries</text>
+  <text x="450" y="196" class="small">Not confidential ACI execution</text>
+  <rect x="880" y="110" width="270" height="110" class="box" stroke="#0078D4" fill="#CFE4FA"/>
+  <text x="900" y="148" class="heading">Microsoft Entra ID</text>
+  <text x="900" y="179">Separate MCP / Foundry tokens</text>
+  <path d="M 300 150 L 430 150" class="line" marker-start="url(#arrow)"/>
+  <text x="320" y="135" class="small">Inference</text>
+  <path d="M 165 110 L 165 90 L 1015 90 L 1015 110" class="line"/>
+  <text x="735" y="83" class="small">Acquire tokens</text>
+  <rect x="30" y="280" width="1120" height="460" class="box" stroke="#0078D4" fill="none" stroke-dasharray="8 5"/>
+  <text x="50" y="311" class="heading">Private VNet - on-premises private routing / VPN + private DNS required</text>
+  <rect x="50" y="335" width="505" height="310" class="box" stroke="#495057" fill="none"/>
+  <text x="65" y="365" class="heading">Internal Container Apps / trusted control plane</text>
+  <text x="65" y="390" class="small">Not confidential; administrators can see routed data</text>
+  <rect x="70" y="420" width="205" height="75" class="box" stroke="#0078D4" fill="#CFE4FA"/>
+  <text x="85" y="449" class="heading">MCP gateway</text>
+  <text x="85" y="477" class="small">Entra + owner + lease checks</text>
+  <rect x="320" y="420" width="210" height="75" class="box" stroke="#0078D4" fill="#CFE4FA"/>
+  <text x="335" y="449" class="heading">Pool controller</text>
+  <text x="335" y="477" class="small">Provision / verify / destroy</text>
+  <rect x="70" y="550" width="205" height="70" class="box" stroke="#495057" fill="#F3F2F1"/>
+  <text x="85" y="579">Private Table lease store</text>
+  <text x="85" y="604" class="small">Persistent exclusive ownership</text>
+  <rect x="320" y="550" width="210" height="70" class="box" stroke="#495057" fill="#F3F2F1"/>
+  <text x="335" y="579">Controller PKI material</text>
+  <text x="335" y="604" class="small">Issuer keys outside workers</text>
+  <path d="M 165 220 L 165 420" class="line"/>
+  <text x="175" y="254" class="small">HTTPS MCP + sandbox token</text>
+  <path d="M 170 495 L 170 550" class="line"/>
+  <path d="M 390 495 L 270 550" class="line"/>
+  <path d="M 425 495 L 425 550" class="line"/>
+  <rect x="680" y="335" width="445" height="310" class="box" stroke="#107C10" fill="none"/>
+  <text x="700" y="365" class="heading">Worker subnet - restrictive NSG</text>
+  <text x="700" y="390" class="small">No worker-to-worker or control/state access</text>
+  <rect x="705" y="420" width="390" height="80" class="box" stroke="#107C10" fill="#DFF6DD"/>
+  <text x="725" y="449" class="heading">Confidential group A - SEV-SNP TEE</text>
+  <text x="725" y="478">Worker + sidecar; one lifetime session</text>
+  <rect x="705" y="530" width="390" height="80" class="box" stroke="#107C10" fill="#DFF6DD"/>
+  <text x="725" y="559" class="heading">Confidential group B - SEV-SNP TEE</text>
+  <text x="725" y="588">Worker + sidecar; destroy after use</text>
+  <path d="M 275 445 L 290 445 L 290 410 L 665 410 L 665 460 L 705 460" class="line"/>
+  <text x="565" y="430" class="small">Mutual TLS</text>
+  <path d="M 530 475 L 605 475 L 605 570 L 705 570" class="line"/>
+  <text x="560" y="510" class="small">Azure API</text>
+  <text x="560" y="530" class="small">create/delete</text>
+  <rect x="705" y="670" width="390" height="48" class="box" stroke="#495057" fill="#F3F2F1"/>
+  <text x="725" y="700">MAA attestation / digest-pinned registry</text>
+  <path d="M 900 610 L 900 670" class="line"/>
+  <text x="50" y="695" class="small">Restricted service egress via NAT; no package/Git internet access.</text>
+  <text x="30" y="775">Attestation binds approved policy + security baseline to the worker TLS key before admission.</text>
+  <text x="30" y="803">Tool summaries returned to Foundry leave the TEE. This is not end-to-end confidential inference.</text>
+</svg>

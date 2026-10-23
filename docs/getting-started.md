@@ -1,181 +1,164 @@
-# Getting started: pooled confidential sandbox
+# Getting started
 
-This guide describes deploying and onboarding the pooled design: one confidential
-ACI group per session, an Entra-authenticated gateway, a Table lease store, and a
-pool controller. It is a guided setup, not a fully automated installer. Nothing
-is created in Azure until you run the deployment scripts.
+Choose a path: **consume an existing service** from an on-premises notebook/agent,
+or **deploy the service** as an administrator. Examples do not create networking
+or deploy Container Apps, but session allocation can provision billable workers.
+Only synthetic data is appropriate for these pilot examples.
 
-To *use* an already-deployed pilot, go straight to the [pilot guide](pilot-guide.md).
-Design and trust boundaries: [isolated-session-pool.md](isolated-session-pool.md).
+## Consume an existing service
 
-## What belongs to the service, the application, and the user?
+Ask the operator for the private MCP URL, approved TLS certificate fingerprint,
+sandbox API application ID, and access to an approved application identity with
+`Sandbox.Access`. Establish private routing and DNS from your machine first.
+For the agent example, also obtain your Foundry project endpoint, model
+deployment name, and inference permission.
 
-| Item | Who needs it? | Purpose |
-|---|---|---|
-| Gateway TLS certificate | The environment (self-signed, pinned by clients) | Authenticate and encrypt client-to-gateway traffic |
-| Pool PKI (worker-server CA, gateway-client CA, gateway client cert) | Controller holds the worker CA; gateway holds its client key | Gateway-to-worker mutual TLS |
-| Sandbox API app registration | One per environment | Defines the token audience and the `Sandbox.Access` app role |
-| Client/agent app registration (service principal) | One per trusted calling application | Identifies the caller to the gateway |
-| Client secret or certificate | The calling application, not each human user | Lets the application obtain an Entra token |
-| Entra user identity | Each human user | Signs in to the front-end and, if configured, the VPN |
-| VPN client profile | Each workstation using point-to-site VPN | Provides a route into the VNet |
-| `id-pool-gateway`, `id-pool-controller`, `id-pool-acrpull` | The gateway, controller, and worker groups | Table access, worker management, image pull (see [infra\pool\README.md](../infra/pool/README.md)) |
+### Install from the repository root
 
-Do **not** share a daemon's client secret with every user; human users use their
-directory accounts. The gateway certificate, worker certificates, and VPN
-certificate are different credentials, and the MAA attestation token is none of
-them.
-
-## 1. Prepare the repository and administrative access
-
-Install Python 3.11+, Azure CLI with the `confcom` extension, and Docker in Linux-container
-mode (needed only to generate the CCE policy). Create the virtual environment and
-install `pool-control\requirements.txt`, `mcp-build-sandbox\requirements.txt` and `pytest`, then run
-the local tests:
+Python 3.11+ is required. PowerShell examples below keep the repository root as
+the working directory.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests\test_pool_feasibility.py tests\test_pool_control.py
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r examples\requirements-notebooks.txt
+Copy-Item examples\.env.example examples\.env
 ```
 
-Copy `examples\.env.example` to `examples\.env` (git-ignored). Sign in with `az login`
-and confirm the subscription before provisioning.
+On Microsoft-managed devices where public PyPI is blocked, use the approved proxy:
 
-| Responsibility | Required access |
+```powershell
+.\.venv\Scripts\python.exe -m pip install --index-url https://packagefeedproxy.microsoft.io/pypi/simple -r examples\requirements-notebooks.txt
+```
+
+For scripts without Jupyter, install `examples\requirements-agent.txt` or
+`examples\requirements.txt` for the non-agent client. The Agent Framework
+distributions are pinned to the offline-checked compatible API set; they are not
+worker dependencies.
+
+### Verify and pin gateway TLS
+
+The pilot internal ingress uses a self-signed certificate. Obtain the expected
+SHA-256 fingerprint from the operator **over a trusted channel**, then run:
+
+```powershell
+.\.venv\Scripts\python.exe examples\pin_gateway_cert.py https://pool-gateway.REPLACE_DOMAIN/mcp `
+    --expect REPLACE_OPERATOR_SHA256 --out examples\gateway-cert.pem
+```
+
+The operator may run without `--expect` from a trusted network to initially
+publish the fingerprint. Blindly downloading and trusting a certificate does
+not authenticate an unknown server. Never use `verify=False`; after rotation,
+obtain a new trusted fingerprint.
+
+### Configure the client
+
+Fill `examples\.env` using your own values:
+
+| Setting | Purpose |
 |---|---|
-| Deploy ACI, Container Apps, storage, and network resources | Azure management-plane permissions on the target resource groups |
-| Register apps and grant API permission | Entra app-registration and admin-consent permissions |
-| Assign custom roles and role assignments | Role-assignment permission on the scopes in the infra README |
-| DNS and VPN administration | Your DNS and network administrators |
+| `POOL_GATEWAY_URL` | Private HTTPS MCP endpoint |
+| `POOL_GATEWAY_CA` | Verified PEM path, e.g. `gateway-cert.pem` |
+| `MCP_API_APP_ID` | Sandbox API application GUID, not the caller app ID |
+| `MCP_TENANT_ID`, `MCP_CLIENT_ID`, `MCP_CLIENT_SECRET` | Authorized caller app; secret **value**, not secret ID |
+| `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL` | Agent only: Foundry project and model deployment |
 
-## 2. Shared prerequisites
+Relative file paths resolve from `examples`, whether launched from the root or
+examples directory. Existing process environment settings take precedence over
+`.env`. Keep secrets, PEM/private keys, and generated notebook outputs out of Git.
 
-The pool deploys **into** an existing VNet; it does not create the VNet, VPN,
-resolver, NAT gateway, or registry. Provide:
+## Authentication from on-premises
 
-1. A VNet with a point-to-site or other route from callers, and a DNS server that
-   resolves linked private zones (an Azure DNS Private Resolver works for VPN clients).
-2. A NAT gateway (here `natgw-aci` / `pip-aci-nat`) that the worker subnet is attached to. MAA and ACR have
-   no private path, so workers egress through it. NAT is not an egress allowlist.
-3. An ACR (here `acrconfmcpvisdzn`) holding the worker image, digest-pinned.
-4. A region supporting confidential ACI and enough confidential-core quota (20 workers = 60 cores).
+**MCP:** `ClientSecretCredential` obtains a client-credentials token for
+`api://<MCP_API_APP_ID>/.default`. The local HTTP client attaches
+`Authorization: Bearer <token>`. The gateway validates it and requires
+`Sandbox.Access`; every session is owned by the authenticated Entra principal.
+The model never receives this token or the app secret.
 
-The infra stages create the control and worker subnets (`snet-pool-control`,
-`snet-pool-workers`), NSG, identities, private Table, DNS and the internal
-Container Apps environment.
+**Foundry:** the agent separately uses `DefaultAzureCredential` to access the
+Foundry project/model. For local development, sign in with `az login` using an
+identity with the required Foundry data-plane permissions (normally Azure AI
+User on the applicable project/account scope). The configured model must support
+function calling. This identity may differ from the MCP app. Do not confuse a
+Foundry token with the sandbox API token.
 
-## 3. Register the sandbox API and the calling application
+The example's `MCP_*` variables do not configure `DefaultAzureCredential`:
+that credential chain uses Azure Identity's standard settings/local sign-in.
+Do not put MCP secrets into `AZURE_*` variables unintentionally. An on-premises
+daemon needs its own approved Foundry credential source, not an assumption that
+Azure managed identity is available on-premises.
 
-### Sandbox API registration
+When `MCP_CLIENT_SECRET` is absent, the MCP helper falls back to
+`DefaultAzureCredential`. Direct user sign-in requires separate API client
+pre-authorization/delegated configuration and user/group role assignment;
+`az login` alone does not enable it. The app-secret flow is the supported
+walkthrough. For production, prefer certificate credentials or approved
+workload federation and documented rotation; certificate auth is not implemented
+by these examples.
 
-In **Microsoft Entra ID > App registrations**:
+**Shared identity limitation:** multiple people using one daemon app share
+gateway ownership. Keep app credentials in a trusted application; do not distribute
+them as individual-user credentials. Per-human authorization/delegation is a
+separate application design.
 
-1. Register a single-tenant application for the sandbox API and record its
-   **Application (client) ID** as `API_APP_ID`.
-2. Under **Expose an API**, set the Application ID URI to `api://<API_APP_ID>`.
-3. Under **App roles**, create an enabled role with value `Sandbox.Access`; allowed
-   member type **Applications** (and **Users/Groups** if people sign in directly).
-4. Set `api.requestedAccessTokenVersion` to `2` in the manifest.
-5. On the corresponding **Enterprise application**, enable **Assignment required**.
-
-The gateway validates the token's signature, issuer, audience and expiry, requires
-the `Sandbox.Access` role, and uses the token's object id as the session owner.
-
-### Client/agent registration
-
-1. Register a separate single-tenant application for the trusted caller (no redirect URI for a daemon).
-2. Under **API permissions > My APIs**, add the **Application permission** `Sandbox.Access` and grant admin consent.
-3. Create a client secret (or certificate); store the secret **value** in `examples\.env` as `MCP_CLIENT_SECRET`.
-
-Role assignment to additional principals is described in the
-[pilot guide](pilot-guide.md#admins-assign-the-app-role).
-
-## 4. Deploy the pool
-
-From `infra\pool`, run the infrastructure stages in order (each runs what-if, validate, deploy;
-add `-WhatIfOnly` to stop after what-if):
+### Run
 
 ```powershell
-cd infra\pool
-.\deploy-pool-infra.ps1 -Stage preflight
-.\deploy-pool-infra.ps1 -Stage network
-.\deploy-pool-infra.ps1 -Stage identity
-.\deploy-pool-infra.ps1 -Stage state
-.\deploy-pool-infra.ps1 -Stage dns
-.\deploy-pool-infra.ps1 -Stage rbac
-.\deploy-pool-infra.ps1 -Stage environment
+.\.venv\Scripts\python.exe -m jupyter lab
+# Open examples\01_mcp_tools.ipynb, then examples\02_agent_framework.ipynb.
+# In VS Code, explicitly select .venv as the notebook kernel.
+
+.\.venv\Scripts\python.exe examples\pooled_analysis.py
+.\.venv\Scripts\python.exe examples\agent_framework_analysis.py
 ```
 
-Then generate the PKI and the approved policy base, and deploy the apps:
+Notebook cells use top-level `await`, not nested `asyncio.run()`. The direct
+script writes `examples\summary.csv`; the agent writes `examples\agent_summary.csv`.
+The agent/notebooks validate synthetic counts, means and sums. Upload/download
+bytes stay in local code; aggregate execution output is sent to Foundry.
+
+## Deploy as an administrator
+
+This is a guided deployment into existing shared infrastructure, not a complete
+installer. Follow [infra\pool\README.md](../infra/pool/README.md) for explicit
+parameters and stage commands. No example silently selects the original pilot.
+
+Prerequisites: Azure CLI, appropriate permissions, an existing VNet with
+non-overlapping delegated subnets/private-endpoint subnet, private routing/DNS,
+NAT, registry, Log Analytics workspace, confidential ACI regional capacity/quota,
+and Docker in Linux-container mode plus `az confcom` for offline CCE generation.
+The infrastructure does not create the shared VPN/VNet/resolver/registry.
+
+### Register and authorize the sandbox API
+
+1. Register a single-tenant API app; expose `api://<api-app-id>`.
+2. Set `api.requestedAccessTokenVersion` to `2`.
+3. Add the enabled app role `Sandbox.Access`, allowing **Applications**.
+   Add Users/Groups only when intentionally implementing direct-user access.
+4. Enable assignment required on the enterprise application.
+5. Register a separate trusted caller app, grant its **application permission**
+   `Sandbox.Access` on this API and grant admin consent. Provision its secret
+   securely outside Git.
+
+Role assignment administration is in the [pilot guide](pilot-guide.md).
+Deploy shared infrastructure, generate PKI and a policy base for the exact
+worker/sidecar digests, then deploy the gateway/controller and configure private
+ingress DNS. Approve attestation minimums and residual risks explicitly;
+historical pilot observations are not a universal security baseline.
+
+The sidecar produces attestation evidence only. No HSM or Secure Key Release is
+required. When releasing new worker source, rebuild/push the worker image,
+regenerate the approved CCE policy base, and update pinned digests together.
+
+## Offline checks and live acceptance
+
+Install test/runtime dependencies when preparing a development environment:
 
 ```powershell
-# PKI (outputs under .azure\pool-pilot\pki, git-ignored)
-.\.venv\Scripts\python.exe infra\pool\make_pki.py
-# Offline policy base for the digest-pinned worker + sidecar images (needs az confcom + Docker; run az acr login first)
-.\.venv\Scripts\python.exe infra\pool\make_policy_base.py --worker-image <registry>/<image>@sha256:<digest> `
-    --sidecar-image <registry>/<sidecar>@sha256:<digest> --pull-identity <id-pool-acrpull resource id> `
-    --registry <registry>.azurecr.io --output .azure\pool-pilot\policy-base.json
-# Gateway + controller apps
-cd infra\pool
-.\deploy-pool-apps.ps1 -Stage ingress-dns
-.\deploy-pool-apps.ps1 -Stage material
-.\deploy-pool-apps.ps1 -Stage build
-.\deploy-pool-apps.ps1 -Stage apps -ImageDigest <digest printed by the build stage> -DesiredReady 2 -MaxTotal 3
+.\.venv\Scripts\python.exe -m pip install -r pool-control\requirements.txt -r mcp-build-sandbox\requirements.txt -r examples\requirements-notebooks.txt pytest
+.\.venv\Scripts\python.exe -m pytest -q tests\test_examples.py tests\test_public_docs.py tests\test_public_infra.py tests\test_pool_control.py tests\test_pool_feasibility.py
 ```
 
-The sidecar (`mcr.microsoft.com/aci/skr`) is used only to produce attestation reports; no
-key is released and no HSM or Key Vault is required.
-
-If the worker source changes, rebuild and push the worker image, regenerate the policy
-base against the new digest, and redeploy; the controller refuses a policy that does
-not match the approved base.
-
-## 5. Make the gateway reachable and trusted
-
-Clients connect over the VPN or from inside the VNet. The environment's internal
-ingress presents a **self-signed** certificate that clients pin:
-
-```powershell
-python examples\pin_gateway_cert.py https://pool-gateway.<env-domain>/mcp --out gateway-cert.pem
-```
-
-Publish the printed SHA-256 fingerprint over a trusted channel; users re-run with
-`--expect <sha256>`. VPN clients need the private DNS zone for the environment
-domain to resolve (see [infra\pool\README.md](../infra/pool/README.md)).
-
-## 6. Validate
-
-Run an end-to-end analysis from a VPN-connected workstation, after setting
-`POOL_GATEWAY_URL` and `POOL_GATEWAY_CA` in `examples\.env`:
-
-```powershell
-python examples\pooled_analysis.py
-```
-
-It creates a session, waits until active, uploads a spreadsheet, runs pandas,
-downloads `summary.csv` and deletes the session in a `finally` block. A worker
-destroyed after use is expected; check `rg-confidential-pool` for leftovers.
-
-## 7. Onboard people without distributing application credentials
-
-- **Shared agent (current model):** a trusted front-end authenticates each person and calls
-  the gateway as its service principal. Keep the secret in the front-end, never in a user's hands.
-  The gateway enforces that a session is used only by the identity that created it.
-- **Direct user sign-in:** assign the `Sandbox.Access` role to the user or a group and have the
-  client acquire a token for `api://<API_APP_ID>`. Signing in with `az login` additionally
-  requires pre-authorizing Azure CLI on the API app, which is not configured in the pilot.
-- **VPN:** an Entra-authenticated point-to-site VPN uses the Azure VPN Client and the user's
-  Entra sign-in; no personal VPN certificates. VPN access does not by itself grant API access.
-
-## Before production
-
-- Replace the self-signed gateway certificate with a CA-issued one, or keep pinning with a rotation plan.
-- Load- and failure-test toward 10 ready / 20 maximum workers; recheck confidential-core quota and capacity.
-- Decide how SMT residual risk, the pull-only registry identity, and gateway administrator trust fit the data sensitivity.
-- Define monitoring, budget alerts, and a runbook for stuck or leaked worker groups.
-
-## References
-
-- [Pooled design](isolated-session-pool.md), [architecture](ARCHITECTURE.md), [costs](session-pool-costs.md)
-- [Confidential containers on ACI](https://learn.microsoft.com/azure/container-instances/container-instances-confidential-overview)
-- [Microsoft Azure Attestation](https://learn.microsoft.com/azure/attestation/overview)
-- [Microsoft Entra app roles](https://learn.microsoft.com/entra/identity-platform/howto-add-app-roles-in-apps)
+Offline notebook tests use explicit fake MCP/model boundaries and do not call
+Azure. They establish local control flow, schemas and artifacts, not live
+confidential execution. Actual acceptance requires a separately approved
+[live release gate](pilot-guide.md#live-release-gate).

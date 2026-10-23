@@ -1,13 +1,13 @@
 // Worker-subnet NSG. Default-deny: only gateway/controller -> worker, DNS, MAA, and image pull.
 param location string = resourceGroup().location
 param name string = 'nsg-pool-workers'
-param controlCidr string = '192.168.5.0/27'
-param workerCidr string = '192.168.6.0/24'
-param vnetCidr string = '192.168.0.0/16'
-param dnsResolverIp string = '192.168.1.36'
+param controlCidr string
+param workerCidr string
+param vnetCidr string
+param dnsResolverIp string
 param workerPort string = '8000'
 @description('Allow 443 to ACR/Storage tags so ACI can pull the image from a public ACR. Remove once the registry is private.')
-param allowImagePullEgress bool = true
+param allowImagePullEgress bool = false
 
 var allowRules = [
   { name: 'allow-control-to-worker-in', priority: 100, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', src: controlCidr, dst: workerCidr, port: workerPort }
@@ -22,8 +22,8 @@ var allowRules = [
 ]
 
 var pullRules = allowImagePullEgress ? [
-  { name: 'allow-acr-out', priority: 120, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', src: workerCidr, dst: 'AzureContainerRegistry.EastUS2', port: '443' }
-  { name: 'allow-storage-pull-out', priority: 121, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', src: workerCidr, dst: 'Storage.EastUS2', port: '443' }
+  { name: 'allow-acr-out', priority: 120, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', src: workerCidr, dst: 'AzureContainerRegistry.${location}', port: '443' }
+  { name: 'allow-storage-pull-out', priority: 121, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', src: workerCidr, dst: 'Storage.${location}', port: '443' }
 ] : []
 
 resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {

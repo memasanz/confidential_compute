@@ -41,7 +41,7 @@ resource zone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
 
 resource zoneLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
   parent: zone
-  name: 'link-vnet-fabric-foundry'
+  name: 'link-pool-vnet'
   location: 'global'
   properties: {
     registrationEnabled: false
