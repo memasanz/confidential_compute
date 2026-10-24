@@ -18,10 +18,6 @@ param common object
 param gatewayEnv object
 param controllerEnv object
 @secure()
-param serverCaCert string
-@secure()
-param serverCaKey string
-@secure()
 param clientCaCert string
 @secure()
 param gatewayClientCert string
@@ -37,7 +33,6 @@ var commonEnv = [for item in items(common): { name: item.key, value: string(item
 var gatewayExtra = [for item in items(gatewayEnv): { name: item.key, value: string(item.value) }]
 var controllerExtra = [for item in items(controllerEnv): { name: item.key, value: string(item.value) }]
 var pkiFiles = [
-  { name: 'server-ca-cert', path: 'server-ca.pem' }
   { name: 'gateway-client-cert', path: 'gateway-client.pem' }
   { name: 'gateway-client-key', path: 'gateway-client.key' }
 ]
@@ -62,7 +57,6 @@ resource gateway 'Microsoft.App/containerApps@2024-03-01' = {
         allowInsecure: false
       }
       secrets: [
-        { name: 'server-ca-cert', value: serverCaCert }
         { name: 'gateway-client-cert', value: gatewayClientCert }
         { name: 'gateway-client-key', value: gatewayClientKey }
       ]
@@ -76,7 +70,6 @@ resource gateway 'Microsoft.App/containerApps@2024-03-01' = {
         env: concat(commonEnv, gatewayExtra, [
           { name: 'POOL_IDENTITY_CLIENT_ID', value: gatewayClientId }
           { name: 'POOL_GATEWAY_URL', value: gatewayUrl }
-          { name: 'POOL_SERVER_CA', value: '/pki/server-ca.pem' }
           { name: 'POOL_CLIENT_CERT', value: '/pki/gateway-client.pem' }
           { name: 'POOL_CLIENT_KEY', value: '/pki/gateway-client.key' }
         ])
@@ -107,8 +100,6 @@ resource controller 'Microsoft.App/containerApps@2024-03-01' = {
       activeRevisionsMode: 'Single'
       registries: registries
       secrets: [
-        { name: 'server-ca-cert', value: serverCaCert }
-        { name: 'server-ca-key', value: serverCaKey }
         { name: 'client-ca-cert', value: clientCaCert }
         { name: 'gateway-client-cert', value: gatewayClientCert }
         { name: 'gateway-client-key', value: gatewayClientKey }
@@ -122,11 +113,8 @@ resource controller 'Microsoft.App/containerApps@2024-03-01' = {
         resources: { cpu: json('1.0'), memory: '2Gi' }
         env: concat(commonEnv, controllerExtra, [
           { name: 'POOL_IDENTITY_CLIENT_ID', value: controllerClientId }
-          { name: 'POOL_SERVER_CA', value: '/pki/server-ca.pem' }
           { name: 'POOL_CLIENT_CERT', value: '/pki/gateway-client.pem' }
           { name: 'POOL_CLIENT_KEY', value: '/pki/gateway-client.key' }
-          { name: 'POOL_CA_CERT', value: '/pki/server-ca.pem' }
-          { name: 'POOL_CA_KEY', value: '/pki/server-ca.key' }
           { name: 'POOL_GATEWAY_CLIENT_CA', value: '/pki/client-ca.pem' }
           { name: 'POOL_MATERIAL_ROOT', value: '/app/pool-control/material' }
         ])
@@ -140,8 +128,6 @@ resource controller 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'pki'
           storageType: 'Secret'
           secrets: [
-            { secretRef: 'server-ca-cert', path: 'server-ca.pem' }
-            { secretRef: 'server-ca-key', path: 'server-ca.key' }
             { secretRef: 'client-ca-cert', path: 'client-ca.pem' }
             { secretRef: 'gateway-client-cert', path: 'gateway-client.pem' }
             { secretRef: 'gateway-client-key', path: 'gateway-client.key' }

@@ -25,7 +25,7 @@
     {"id":"store","type":"rectangle","x":70,"y":680,"width":210,"height":80,"strokeColor":"#495057","backgroundColor":"#F3F2F1","fillStyle":"solid","strokeWidth":2},
     {"id":"store-text","type":"text","x":85,"y":690,"width":180,"height":65,"text":"Private Table leases\nExclusive ownership","fontSize":16,"fontFamily":2,"strokeColor":"#000000"},
     {"id":"material","type":"rectangle","x":320,"y":680,"width":220,"height":80,"strokeColor":"#495057","backgroundColor":"#F3F2F1","fillStyle":"solid","strokeWidth":2},
-    {"id":"material-text","type":"text","x":335,"y":690,"width":190,"height":65,"text":"Controller PKI material\nIssuer keys outside workers","fontSize":16,"fontFamily":2,"strokeColor":"#000000"},
+    {"id":"material-text","type":"text","x":335,"y":690,"width":190,"height":65,"text":"Gateway client credentials\nNo worker keys held here","fontSize":16,"fontFamily":2,"strokeColor":"#000000"},
     {"id":"ingress","type":"arrow","x":170,"y":290,"width":0,"height":250,"points":[[0,0],[0,250]],"strokeColor":"#495057","strokeWidth":2,"endArrowhead":"arrow"},
     {"id":"ingress-text","type":"text","x":185,"y":305,"width":600,"height":40,"text":"HTTPS MCP + sandbox token over private route","fontSize":14,"fontFamily":2,"strokeColor":"#000000"},
     {"id":"workers","type":"rectangle","x":700,"y":420,"width":450,"height":360,"strokeColor":"#107C10","backgroundColor":"transparent","strokeWidth":2},
@@ -35,7 +35,7 @@
     {"id":"worker-b","type":"rectangle","x":720,"y":680,"width":410,"height":80,"strokeColor":"#107C10","backgroundColor":"#DFF6DD","fillStyle":"solid","strokeWidth":2},
     {"id":"worker-b-text","type":"text","x":735,"y":690,"width":380,"height":65,"text":"Confidential group B - SEV-SNP TEE\nWorker + sidecar; destroy after use","fontSize":16,"fontFamily":2,"strokeColor":"#000000"},
     {"id":"mutual-tls","type":"arrow","x":280,"y":565,"width":440,"height":45,"points":[[0,0],[10,0],[10,-45],[395,-45],[395,0],[440,0]],"strokeColor":"#495057","strokeWidth":2,"endArrowhead":"arrow"},
-    {"id":"mtls-text","type":"text","x":575,"y":525,"width":120,"height":40,"text":"Mutual TLS","fontSize":14,"fontFamily":2,"strokeColor":"#000000"},
+    {"id":"mtls-text","type":"text","x":575,"y":525,"width":120,"height":40,"text":"mTLS, attested key","fontSize":14,"fontFamily":2,"strokeColor":"#000000"},
     {"id":"lifecycle","type":"arrow","x":540,"y":600,"width":180,"height":120,"points":[[0,0],[90,0],[90,120],[180,120]],"strokeColor":"#495057","strokeWidth":2,"endArrowhead":"arrow"},
     {"id":"lifecycle-text","type":"text","x":575,"y":620,"width":120,"height":60,"text":"Azure API\ncreate/delete","fontSize":14,"fontFamily":2,"strokeColor":"#000000"},
     {"id":"gw-state","type":"arrow","x":175,"y":620,"width":0,"height":60,"points":[[0,0],[0,60]],"strokeColor":"#495057","strokeWidth":2,"endArrowhead":"arrow"},
@@ -45,6 +45,6 @@
     {"id":"services-text","type":"text","x":735,"y":820,"width":380,"height":40,"text":"MAA attestation / digest-pinned registry","fontSize":16,"fontFamily":2,"strokeColor":"#000000"},
     {"id":"egress","type":"arrow","x":925,"y":760,"width":0,"height":50,"points":[[0,0],[0,50]],"strokeColor":"#495057","strokeWidth":2,"endArrowhead":"arrow"},
     {"id":"egress-text","type":"text","x":60,"y":810,"width":620,"height":60,"text":"Restricted service egress via NAT.\nNo package/Git internet access.","fontSize":14,"fontFamily":2,"strokeColor":"#000000"},
-    {"id":"footer","type":"text","x":30,"y":900,"width":1150,"height":90,"text":"Attestation binds approved policy + security baseline to the worker TLS key before admission.\nTool summaries returned to Foundry leave the TEE. This is not end-to-end confidential inference.","fontSize":16,"fontFamily":2,"strokeColor":"#000000"}
+    {"id":"footer","type":"text","x":30,"y":900,"width":1150,"height":90,"text":"Each worker generates its own TLS key in the TEE; attestation binds it, the approved policy and security baseline before admission.\nTool summaries returned to Foundry leave the TEE. This is not end-to-end confidential inference.","fontSize":16,"fontFamily":2,"strokeColor":"#000000"}
   ]
 }

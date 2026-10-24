@@ -1,6 +1,5 @@
-"""Explicit loopback dialing preserves DNS Host/SNI and full TLS verification."""
+"""Explicit loopback dialing preserves DNS Host/SNI."""
 
-import ssl
 import socket
 
 import httpx
@@ -32,7 +31,6 @@ def pinned_request(request):
 
 class LoopbackTransport(httpx.HTTPTransport):
     def __init__(self, context):
-        assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
         super().__init__(verify=context, trust_env=False, retries=0)
 
     def handle_request(self, request):
@@ -41,7 +39,6 @@ class LoopbackTransport(httpx.HTTPTransport):
 
 class AsyncLoopbackTransport(httpx.AsyncHTTPTransport):
     def __init__(self, context):
-        assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
         super().__init__(verify=context, trust_env=False, retries=0)
 
     async def handle_async_request(self, request):

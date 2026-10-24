@@ -8,13 +8,13 @@ AMD SEV-SNP TEE with a worker and attestation sidecar. A controller implements
 prewarming, exclusive leasing, provisioning, admission and destruction.
 
 The worker, gateway/controller, Table state, infrastructure and client paths are
-implemented. Historical live validation covered a small 3-maximum/2-ready pilot,
-not the 10-ready/20-maximum scale target. The last historical operating note
-records zero desired ready workers; current Azure state is unknown.
+implemented, including a per-session encrypted channel (X25519 key agreement,
+AES-256-GCM) bound to the attested worker. Live validation so far covers a
+3-maximum/2-ready configuration, not the 10-ready/20-maximum scale target.
+Current Azure state is recorded in [operations](operations.md), not here.
 
-This sharing release adds on-premises Agent Framework / Foundry examples and
-offline checks. It does not deploy or certify production readiness. See
-[architecture](ARCHITECTURE.md), [operations/live gate](operations.md) and
+See [architecture](ARCHITECTURE.md), [operations/live gate](operations.md),
+[requirements assessment](requirements-assessment.md) and
 [costs](session-pool-costs.md).
 
 ## Why a group per session
@@ -65,7 +65,7 @@ Foundry inference, gateway/controller and PKI administrators remain outside the
 confidential boundary. Gateway administrators can see routed data; model-visible
 tool summaries leave the TEE. This is not confidential end-to-end inference.
 
-Historical pilot risk acceptances are **not defaults for another deployment**:
+These risk acceptances are **not defaults for another deployment**:
 
 - **SMT-enabled hosts:** side channels between threads sharing a core are not
   removed by SEV-SNP memory encryption. Admission must reflect an explicitly
@@ -78,15 +78,21 @@ Historical pilot risk acceptances are **not defaults for another deployment**:
 
 ## TLS, attestation and policy
 
-Workers have unique TLS server certificates; the gateway holds its client
-certificate. Worker issuer private material stays with the controller, never
-in workers. Per-worker keys are deterministically derived using controller-held
-issuer material so controller restarts can reproduce the intended certificate.
-Enforce server/client authentication, purpose, hostname/key binding and normal
-TLS verification; no plaintext or `verify=False` fallback.
+Each worker generates its own TLS key inside the TEE at startup; the private key
+lives only in memory-backed worker storage and is never in configuration, the
+environment or controller storage. The controller issues no worker certificate.
+The gateway authenticates to the worker with its client certificate (mTLS) and
+trusts the worker only after MAA evidence commits to the TLS public key it
+observed on that same connection; later calls are pinned to that key. A
+man-in-the-middle key therefore fails admission. Gateway-to-worker traffic is
+never plaintext.
 
-Admission verifies MAA signatures/issuer, fresh challenge and TLS public-key
-binding, approved CCE policy hash and applicable security claims/SVN minimums.
+On top of TLS, admission establishes a per-session key (X25519 + AES-256-GCM)
+whose public half is also committed in the attestation, so request and result
+payloads stay encrypted to the attested worker.
+
+Admission verifies MAA signatures/issuer, fresh challenge, TLS public-key and
+session-key binding, approved CCE policy hash and applicable security claims/SVN minimums.
 Retrieving or decoding `get_attestation` output is **not verification** and does
 not attest the outside-TEE gateway or future arbitrary code behavior.
 
@@ -98,7 +104,7 @@ rebuild/push, new pinned digest, regenerated policy base and reviewed release.
 
 The pool has no HSM or Secure Key Release path. Workers attest through MAA;
 there is no application secret whose release must be gated by attestation.
-Controller-held PKI remains trusted control-plane material. The
+The gateway client CA remains trusted control-plane material. The
 `mcr.microsoft.com/aci/skr` sidecar produces evidence only; its key-release API is
 not used. An SKR path would be a separately reviewed future feature.
 
@@ -146,8 +152,8 @@ the actual release image rather than treating that old digest as current.
 | Scale toward 10/20 | Representative bursts, queue expiry, failed provisioning/deletion, restart/reconciliation and cost measurements |
 | Production | Security/risk acceptance, user authorization model, monitoring, key/cert rotation, budget/runbooks and explicit approval |
 
-Implementation or offline test success does not authorize Azure deployment,
-warm-up or publication. Public cleanup removes environment values from the
+Offline test success does not by itself authorize Azure deployment or
+warm-up. Public cleanup removes environment values from the
 current tracked tree, not Git history; history remediation requires separate
 approval.
 

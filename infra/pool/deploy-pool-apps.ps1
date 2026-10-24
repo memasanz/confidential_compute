@@ -116,7 +116,7 @@ $root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $operational = if ([System.IO.Path]::IsPathRooted($OperationalDirectory)) { $OperationalDirectory } else { Join-Path $root $OperationalDirectory }
 $here = $PSScriptRoot
 if ($Stage -eq 'apps') {
-    foreach ($name in @('server-ca.pem', 'server-ca.key', 'client-ca.pem', 'gateway-client.pem', 'gateway-client.key')) {
+    foreach ($name in @('client-ca.pem', 'gateway-client.pem', 'gateway-client.key')) {
         if (-not (Test-Path -LiteralPath (Join-Path $operational "pki\$name") -PathType Leaf)) {
             throw "Missing operational input pki\$name in -OperationalDirectory"
         }
@@ -187,7 +187,7 @@ switch ($Stage) {
             POOL_RECONCILE_SECONDS = 15; POOL_MATERIAL_FACTORY = 'material:environment'
             POOL_MATERIAL_ACL_CONFIRMED = $MaterialAclConfirmed
             POOL_WORKER_IMAGE = "$acr/mcp-build-sandbox@$WorkerImageDigest"; POOL_SIDECAR_IMAGE = "$acr/aci/skr@$SidecarImageDigest"
-            POOL_CERT_DAYS = 2; POOL_CONFCOM_TIMEOUT = 1200; POOL_AZ_EXECUTABLE = 'az'
+            POOL_CONFCOM_TIMEOUT = 1200; POOL_AZ_EXECUTABLE = 'az'
             POOL_POLICY_BASE = '/app/infra/pool/policy-base.json'
             POOL_PULL_IDENTITY = $pull.id; POOL_REGISTRY_SERVER = $acr
             POOL_ALLOW_PULL_RUNTIME_IDENTITY = $AllowPullRuntimeIdentity.ToString().ToLowerInvariant(); POOL_PULL_ROLE_ATTESTED = $PullRoleAttested
@@ -197,7 +197,7 @@ switch ($Stage) {
             image = "$acr/pool-control@$ImageDigest"; registryServer = $acr; pullIdentityId = $pull.id
             gatewayIdentityId = $gw.id; gatewayClientId = $gw.c; controllerIdentityId = $ctl.id; controllerClientId = $ctl.c
             gatewayUrl = "https://pool-gateway.$domain/mcp"; common = $common; gatewayEnv = $gatewayEnv; controllerEnv = $controllerEnv
-            serverCaCert = (& $text 'server-ca.pem'); serverCaKey = (& $text 'server-ca.key'); clientCaCert = (& $text 'client-ca.pem')
+            clientCaCert = (& $text 'client-ca.pem')
             gatewayClientCert = (& $text 'gateway-client.pem'); gatewayClientKey = (& $text 'gateway-client.key')
         }
         $doc = @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'

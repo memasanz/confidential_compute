@@ -45,8 +45,8 @@
   <text x="85" y="579">Private Table lease store</text>
   <text x="85" y="604" class="small">Persistent exclusive ownership</text>
   <rect x="320" y="550" width="210" height="70" class="box" stroke="#495057" fill="#F3F2F1"/>
-  <text x="335" y="579">Controller PKI material</text>
-  <text x="335" y="604" class="small">Issuer keys outside workers</text>
+  <text x="335" y="579">Gateway client credentials</text>
+  <text x="335" y="604" class="small">No worker keys held here</text>
   <path d="M 165 220 L 165 420" class="line"/>
   <text x="175" y="254" class="small">HTTPS MCP + sandbox token</text>
   <path d="M 170 495 L 170 550" class="line"/>
@@ -62,7 +62,7 @@
   <text x="725" y="559" class="heading">Confidential group B - SEV-SNP TEE</text>
   <text x="725" y="588">Worker + sidecar; destroy after use</text>
   <path d="M 275 445 L 290 445 L 290 410 L 665 410 L 665 460 L 705 460" class="line"/>
-  <text x="565" y="430" class="small">Mutual TLS</text>
+  <text x="565" y="430" class="small">mTLS, attested key</text>
   <path d="M 530 475 L 605 475 L 605 570 L 705 570" class="line"/>
   <text x="560" y="510" class="small">Azure API</text>
   <text x="560" y="530" class="small">create/delete</text>
@@ -70,6 +70,6 @@
   <text x="725" y="700">MAA attestation / digest-pinned registry</text>
   <path d="M 900 610 L 900 670" class="line"/>
   <text x="50" y="695" class="small">Restricted service egress via NAT; no package/Git internet access.</text>
-  <text x="30" y="775">Attestation binds approved policy + security baseline to the worker TLS key before admission.</text>
+  <text x="30" y="775">Each worker generates its own TLS key in the TEE; attestation binds it, the approved policy and security baseline before admission.</text>
   <text x="30" y="803">Tool summaries returned to Foundry leave the TEE. This is not end-to-end confidential inference.</text>
 </svg>

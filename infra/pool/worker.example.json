@@ -10,8 +10,6 @@
     "sessionId": {"type": "string"},
     "workerHostname": {"type": "string"},
     "maaEndpoint": {"type": "string"},
-    "tlsCert": {"type": "securestring"},
-    "tlsKey": {"type": "securestring"},
     "clientCa": {"type": "string"}
   },
   "resources": [{
@@ -36,8 +34,6 @@
             {"name": "MCP_SESSION_ID", "value": "[parameters('sessionId')]"},
             {"name": "MCP_WORKER_HOSTNAME", "value": "[parameters('workerHostname')]"},
             {"name": "MCP_TLS_CLIENT_CA", "value": "[parameters('clientCa')]"},
-            {"name": "MCP_TLS_CERT", "secureValue": "[parameters('tlsCert')]"},
-            {"name": "MCP_TLS_KEY", "secureValue": "[parameters('tlsKey')]"},
             {"name": "SKR_MAA_ENDPOINT", "value": "[parameters('maaEndpoint')]"},
             {"name": "ATTESTATION_SIDECAR_URL", "value": "http://localhost:8080"}
           ],

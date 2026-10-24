@@ -140,17 +140,14 @@ administrators who can change the governing policies are handled by that
 separation of duties, not by cryptography. The gateway handles plaintext by
 design. Tool results and files transit it, so its administrators must be trusted
 for the data they route. Protection against *all* Azure administrators would
-also need a TEE-generated TLS key (attested TLS) and no gateway plaintext, which
-this design does not implement.
+also need no gateway plaintext, which this design does not implement.
 
-**Residual risk (secret residency):** the per-session key exists only in gateway
-and worker memory. The worker's TLS private key is still created by the
-controller and injected as a worker setting, and the signing CA key is held as a
-service secret. Neither can read or forge session content, and a worker using a
-substituted TLS key fails attestation, because the attested challenge binds the
-TLS key fingerprint and the session public key. Removing the injection would
-need the worker to generate its own TLS key and the gateway to trust the
-attested fingerprint instead of a CA.
+**Secret residency:** the per-session key exists only in gateway and worker
+memory. The worker generates its own TLS key inside the TEE (attested TLS). The
+key is never in configuration, the environment or controller storage, and the
+controller holds no worker signing CA. The gateway accepts the worker only when
+MAA evidence commits to the exact TLS key it observed on that connection, and
+pins later calls to it, so a substituted key fails admission.
 
 ### Worker hardening
 
@@ -223,7 +220,7 @@ automated tests. See the [requirements assessment](docs/requirements-assessment.
 |---|---|
 | `examples\` | Notebooks, on-premises agent, direct client, synthetic spreadsheet |
 | `mcp-build-sandbox\` | Single-lifetime-session worker and image |
-| `pool-control\` | MCP gateway, controller, lease store, Azure adapter, PKI material |
+| `pool-control\` | MCP gateway, controller, lease store, Azure adapter, deployment material |
 | `infra\pool\` | Parameterized deployment, CCE policy generation, smoke probe |
 | `tests\` | Worker, lifecycle, client, notebook and offline integration checks |
 | `docs\` | Architecture, setup, operations, design and [cost estimates](docs/session-pool-costs.md) |

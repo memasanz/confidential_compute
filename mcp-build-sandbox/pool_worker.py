@@ -5,17 +5,17 @@ import hashlib
 import json
 import os
 import re
-import ssl
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.x509.oid import ExtendedKeyUsageOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
 def canonical_challenge(worker_id, session_id, nonce, public_key_sha256, session_public_key):
@@ -89,12 +89,13 @@ class SessionChannel:
     the whole session on any failure, so there is no resynchronisation or resumption.
     """
 
-    def __init__(self, session_key, context):
+    def __init__(self, session_key, context, tls_spki=""):
         if len(session_key) != 32:
             raise ValueError("Session key must be 256 bits")
         keys = HKDF(hashes.SHA256(), 64, None, b"session-channel|" + context).derive(session_key)
         self.request_key, self.response_key = AESGCM(keys[:32]), AESGCM(keys[32:])
-        self.context, self.counter = context, 0
+        # The gateway side records the attested TLS key so later connections can be pinned to it.
+        self.context, self.counter, self.tls_spki = context, 0, tls_spki
 
     def _seal(self, aead, label, counter, message):
         nonce = counter.to_bytes(12, "big")
@@ -135,35 +136,39 @@ def public_key_hash(cert_pem):
     )).hexdigest()
 
 
-def validate_tls(certfile, keyfile, cafile, hostname):
-    if not all((certfile, keyfile, cafile, hostname)):
-        raise ValueError("Pooled mode requires TLS certificate/key, dedicated client CA and worker DNS hostname")
-    cert = x509.load_pem_x509_certificate(Path(certfile).read_bytes())
+def new_tls_identity(hostname):
+    """Create this worker's TLS key and self-signed certificate. Returns (cert_pem, key_pem).
+
+    The key is generated inside the TEE and never leaves it. Clients trust it only because
+    attestation evidence commits to its fingerprint, not because a CA signed it.
+    """
+    key = ec.generate_private_key(ec.SECP256R1())
     now = datetime.now(timezone.utc)
-    if not cert.not_valid_before_utc <= now < cert.not_valid_after_utc:
-        raise ValueError("Worker TLS certificate is not currently valid")
-    eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
-    if ExtendedKeyUsageOID.SERVER_AUTH not in eku or ExtendedKeyUsageOID.CLIENT_AUTH in eku:
-        raise ValueError("Worker certificate must be serverAuth only")
-    names = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    if hostname not in names.get_values_for_type(x509.DNSName):
-        raise ValueError("Worker hostname must exactly match a certificate DNS SAN")
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname.split(".")[0])])
+    cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=2))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), False)
+            .sign(key, hashes.SHA256()))
+    return (cert.public_bytes(serialization.Encoding.PEM),
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption()))
+
+
+def validate_client_trust(cafile):
+    """The worker accepts only gateway client certificates issued by this public CA chain."""
     ca_pem = Path(cafile).read_bytes()
     if b"PRIVATE KEY" in ca_pem:
         raise ValueError("Workers must receive only the PUBLIC gateway client CA trust chain")
     roots = x509.load_pem_x509_certificates(ca_pem)
     if not roots or any(not c.extensions.get_extension_for_class(x509.BasicConstraints).value.ca for c in roots):
         raise ValueError("Client trust must contain CA certificates only")
-    if any(c.subject == cert.issuer for c in roots):
-        raise ValueError("Client issuing CA must be separate from the worker server issuing CA")
+    now = datetime.now(timezone.utc)
     if any(not c.not_valid_before_utc <= now < c.not_valid_after_utc for c in roots):
         raise ValueError("Gateway client trust CA is not currently valid")
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(certfile, keyfile)
-    context.load_verify_locations(cafile=cafile)
-    context.verify_mode = ssl.CERT_REQUIRED
-    return public_key_hash(Path(certfile).read_bytes())
 
 
 class LifetimeSession:

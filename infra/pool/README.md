@@ -29,7 +29,8 @@ does not deploy a Foundry project or model.
 
 You will first prepare access, deploy the service's supporting resources,
 approve its images/security settings, and finally run the sample notebooks.
-This is a pilot deployment, not a production-readiness certification.
+Use synthetic or approved data only; sign-off for sensitive data is a separate
+security decision.
 
 ## Before running anything: who needs to help?
 
@@ -317,8 +318,9 @@ path. Do not enable public access just to get past the error.
 
 ### Generate service certificates
 
-**PKI** here means the certificates/keys used for mutual TLS: the gateway and
-workers prove their identities to one another.
+**PKI** here means the gateway's client certificate and the CA that signs it.
+Workers do not receive a certificate: each generates its own TLS key inside the
+TEE, and the gateway trusts it only after attestation binds that key.
 
 ```powershell
 .\.venv\Scripts\python.exe infra\pool\make_pki.py --output "$operationalDirectory\pki"
@@ -414,7 +416,7 @@ Before filling the settings below, ask your security/service owner for:
 | Approved minimum SVN JSON | Minimum accepted security versions for worker firmware/platform components |
 | SMT decision | Whether SMT-enabled hosts are acceptable for your threat model |
 | Pull-identity approval | Worker code can reach its attached registry-pull identity; it must have AcrPull only on the intended registry |
-| Controller-only material approval | Only authorized control-plane administrators/services can access issuer private material |
+| Controller-only material approval | Only authorized control-plane administrators/services can access the gateway client key and deployment material |
 
 The minimum-version JSON must contain exactly six nonnegative-integer keys:
 `bootloader`, `tee`, `snpfw`, `microcode`, `guest`, `uvm_guest`.
@@ -488,7 +490,7 @@ Do not set `AllowSmt` to true simply to bypass a failure.
 Zero ready is **not a fully stopped or free service**: gateway/controller and
 supporting resources still run, and session requests can create cold workers.
 
-If an approved pilot should keep two workers warm, change
+If you want to keep two workers warm, change
 `$appsInputs.DesiredReady = 2`, then preview/deploy the apps stage again.
 That means **two ready within the three-worker cap**, not three active plus two
 ready. At three active sessions there is no warm reserve. Warm workers cost
@@ -536,7 +538,7 @@ From the actual machine that will run the agent:
 
 Complete the [live release gate](../../docs/operations.md#live-release-gate)
 before declaring the deployment ready. Only synthetic/approved low-sensitivity
-data should be used for this pilot. Summaries sent to Foundry leave the worker's
+data should be used with this deployment. Summaries sent to Foundry leave the worker's
 confidential boundary.
 
 ## If something fails
@@ -563,9 +565,9 @@ The repo does not create a VPN, public gateway, Foundry project/model or a
 production user-facing application. No HSM or Secure Key Release is required:
 the `skr` sidecar is used only for attestation evidence.
 
-The controller uses an ephemeral material volume; persistent material storage
-is not implemented. Review material/rotation requirements before production. The worker
-issuer key remains controller-held; the gateway never receives that issuer key.
+The controller uses an ephemeral volume for policy and deployment material.
+Worker TLS private keys are never held by the controller or gateway; they exist
+only inside each worker's TEE.
 
 To pause new warm provisioning, deploy the same reviewed apps configuration
 with `DesiredReady = 0`. **This does not delete existing workers**. Stopping

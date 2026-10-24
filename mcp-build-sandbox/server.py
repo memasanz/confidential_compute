@@ -21,8 +21,9 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
-from pool_worker import (LifetimeSession, SessionChannel, canonical_challenge, new_worker_keypair,
-                         unwrap_session_key, validate_tls)
+from pool_worker import (LifetimeSession, SessionChannel, canonical_challenge, new_tls_identity,
+                         new_worker_keypair, public_key_hash, unwrap_session_key,
+                         validate_client_trust)
 
 # Root for workspaces; these directories are not a security boundary.
 WORKSPACE = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
@@ -41,12 +42,9 @@ DEFAULT_TIMEOUT = int(os.environ.get("SANDBOX_COMMAND_TIMEOUT", "600"))
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MCP_PORT", "8000"))
 
-# TLS terminates inside the enclave so traffic stays encrypted until it reaches
-# the attested TEE. Supply PEM file paths, or PEM content (e.g. from Key Vault).
-TLS_CERTFILE = os.environ.get("MCP_TLS_CERTFILE", "")
-TLS_KEYFILE = os.environ.get("MCP_TLS_KEYFILE", "")
-TLS_CERT = os.environ.get("MCP_TLS_CERT", "")
-TLS_KEY = os.environ.get("MCP_TLS_KEY", "")
+# TLS terminates inside the enclave. The worker creates its own TLS key at startup (see
+# transport_options), so no TLS private key is ever configured or injected. Only the public
+# gateway client CA is supplied, as PEM content or a file path.
 TLS_CLIENT_CA = os.environ.get("MCP_TLS_CLIENT_CA", "")
 TLS_CLIENT_CAFILE = os.environ.get("MCP_TLS_CLIENT_CAFILE", "")
 WORKER_HOSTNAME = os.environ.get("MCP_WORKER_HOSTNAME", "")
@@ -451,13 +449,6 @@ def _materialize_pem(content: str, suffix: str) -> str:
     return str(path)
 
 
-def _tls_files() -> tuple[str | None, str | None]:
-    """Resolve TLS cert/key to file paths, or (None, None) if not configured."""
-    certfile = TLS_CERTFILE or (_materialize_pem(TLS_CERT, ".crt") if TLS_CERT else None)
-    keyfile = TLS_KEYFILE or (_materialize_pem(TLS_KEY, ".key") if TLS_KEY else None)
-    return certfile, keyfile
-
-
 def _require_gateway():
     if current_caller.get() != "gateway-mtls":
         raise PermissionError("Authenticated gateway mTLS request required")
@@ -465,12 +456,19 @@ def _require_gateway():
 
 def transport_options():
     global TLS_SPKI_SHA256
-    certfile, keyfile = _tls_files()
     if not re.fullmatch(r"[A-Za-z0-9.-]+", SKR_MAA_ENDPOINT) or "." not in SKR_MAA_ENDPOINT:
         raise ValueError("SKR_MAA_ENDPOINT must be a hostname only")
     cafile = TLS_CLIENT_CAFILE or (
         _materialize_pem(TLS_CLIENT_CA, ".ca") if TLS_CLIENT_CA else None)
-    TLS_SPKI_SHA256 = validate_tls(certfile, keyfile, cafile, WORKER_HOSTNAME)
+    if not cafile or not WORKER_HOSTNAME:
+        raise ValueError("Pooled mode requires the gateway client CA and the worker DNS hostname")
+    validate_client_trust(cafile)
+    # The key is created here, inside the TEE. Attestation commits to its fingerprint, so the
+    # gateway trusts this key only after verifying hardware evidence, not a certificate authority.
+    cert_pem, key_pem = new_tls_identity(WORKER_HOSTNAME)
+    TLS_SPKI_SHA256 = public_key_hash(cert_pem)
+    certfile = _materialize_pem(cert_pem.decode("ascii"), ".crt")
+    keyfile = _materialize_pem(key_pem.decode("ascii"), ".key")
     return dict(ssl_certfile=certfile, ssl_keyfile=keyfile,
                 ssl_ca_certs=cafile, ssl_cert_reqs=ssl.CERT_REQUIRED,
                 proxy_headers=False)

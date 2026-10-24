@@ -463,7 +463,6 @@ def test_real_gateway_entra_mcp_worker_mtls_with_fake_azure_and_maa(
     client_ca, server_ca = issue("client-ca"), issue("server-ca")
     for name, pair in (
         ("client-ca", client_ca), ("server-ca", server_ca),
-        ("worker", issue("worker", server_ca, ExtendedKeyUsageOID.SERVER_AUTH, hostname)),
         ("gateway-client", issue("gateway-client", client_ca, ExtendedKeyUsageOID.CLIENT_AUTH)),
         ("gateway-server", issue("gateway-server", server_ca, ExtendedKeyUsageOID.SERVER_AUTH, "localhost")),
     ):
@@ -480,8 +479,6 @@ def test_real_gateway_entra_mcp_worker_mtls_with_fake_azure_and_maa(
     spec.loader.exec_module(worker_server)
     # Avoid package bootstrap in this routing test; real worker shell/files still execute.
     monkeypatch.setattr(worker_server.venv, "create", lambda *args, **kwargs: None)
-    worker_server.TLS_CERTFILE = str(directory / "worker.pem")
-    worker_server.TLS_KEYFILE = str(directory / "worker.key")
     worker_server.TLS_CLIENT_CAFILE = str(directory / "client-ca.pem")
     worker_server.WORKER_HOSTNAME, worker_server.SKR_MAA_ENDPOINT = hostname, "unit.test"
     # The fake MAA boundary signs the exact worker-generated TLS/identity challenge.
@@ -536,14 +533,12 @@ def test_real_gateway_entra_mcp_worker_mtls_with_fake_azure_and_maa(
         app.add_middleware(worker_server.GatewayAuthMiddleware)
         worker_port = start(app, worker_server.transport_options())
         transport = WorkerTransport(
-            str(directory / "server-ca.pem"), str(directory / "gateway-client.pem"),
+            str(directory / "gateway-client.pem"),
             str(directory / "gateway-client.key"), "pool.test", "127.0.0.0/8",
             "https://unit.test", minima, store.limits,
             signing_key=signing[0].public_key(), port=worker_port)
         azure = FakeAzure()
-        routing = {"hostname": hostname, "ip": "127.0.0.1",
-                   "spki": public_key_hash((directory / "worker.pem").read_bytes()),
-                   "policy_hash": "b" * 64}
+        routing = {"hostname": hostname, "ip": "127.0.0.1", "policy_hash": "b" * 64}
         def ensure(candidate):
             if candidate["id"] != w["id"]:
                 return None
@@ -553,6 +548,17 @@ def test_real_gateway_entra_mcp_worker_mtls_with_fake_azure_and_maa(
         controller = Controller(store, azure, transport)
         asyncio.run(controller.tick())
         assert store.view()["w:" + w["id"]]["state"] == "ready"
+        # A different key on the wire (a man in the middle) yields a challenge the TEE never signed.
+        bound = {"id": w["id"], "lifetime": w["lifetime"], "routing": routing}
+        async def impostor():
+            async with transport.connect(bound) as (session, peer):
+                peer["spki"] = "0" * 64
+                with pytest.raises(Exception):
+                    await transport.verify(session, peer, bound)
+            with pytest.raises(Exception):
+                async with transport.connect(bound, "0" * 64):
+                    pass
+        asyncio.run(impostor())
         tenant, oid = str(uuid.uuid4()), str(uuid.uuid4())
         verifier = EntraVerifier(tenant, "pool-api", ["Execute"], [], signing_key=signing[0].public_key())
         # Reserve listener first so the configured canonical ingress host includes its port.
@@ -651,23 +657,20 @@ def test_live_adapter_material_sdk_mapping_and_strict_resource_dns_bounds():
               "create_operation": uuid.uuid4().hex, "delete_operation": uuid.uuid4().hex}
     host = worker["id"] + ".pool.test"
     server_ca, client_ca = issue("server-ca"), issue("client-ca")
-    key, cert = pem(issue("worker", server_ca, ExtendedKeyUsageOID.SERVER_AUTH, host))
     policy = b"TEST_FIXTURE_ONLY_NOT_A_CCE_POLICY"
     values = {
         "MCP_WORKER_MODE": "pooled", "MCP_WORKER_ID": worker["id"],
         "MCP_SESSION_ID": worker["lifetime"], "MCP_WORKER_HOSTNAME": host,
-        "MCP_TLS_CERT": cert, "MCP_TLS_KEY": key,
         "MCP_TLS_CLIENT_CA": pem(client_ca)[1], "SKR_MAA_ENDPOINT": "unit.test"}
     containers = [
         {"name": "mcp-server", "properties": {
             "image": "private.example/worker@sha256:" + "a" * 64,
-            "environmentVariables": [{"name": k, "secureValue" if k in ("MCP_TLS_KEY", "MCP_TLS_CERT") else "value": v}
-                                     for k, v in values.items()],
+            "environmentVariables": [{"name": k, "value": v} for k, v in values.items()],
             "resources": {"requests": {"cpu": 2, "memoryInGB": 4}}}},
         {"name": "attestation-sidecar", "properties": {
             "image": "private.example/sidecar@sha256:" + "b" * 64,
             "resources": {"requests": {"cpu": 1, "memoryInGB": 1}}}}]
-    material = {"server_cert": cert, "policy_hash": hashlib.sha256(policy).hexdigest(),
+    material = {"policy_hash": hashlib.sha256(policy).hexdigest(),
                 "group": {"name": adapter.name(worker), "location": "eastus2",
                           "properties": {"sku": "Confidential", "osType": "Linux",
                                          "ipAddress": {"type": "Private"},
@@ -679,7 +682,13 @@ def test_live_adapter_material_sdk_mapping_and_strict_resource_dns_bounds():
     model = ContainerGroup.from_dict(material["group"])
     assert model.sku == "Confidential"
     assert model.confidential_compute_properties.cce_policy
-    assert model.containers[0].environment_variables[5].secure_value == key
+    assert model.containers[0].environment_variables[5].value == "unit.test"
+    # A controller-supplied TLS key is exactly what must no longer be accepted.
+    smuggled = copy.deepcopy(material)
+    smuggled["group"]["properties"]["containers"][0]["properties"]["environmentVariables"].append(
+        {"name": "MCP_TLS_KEY", "secureValue": "controller-issued"})
+    with pytest.raises(ValueError, match="Unapproved worker environment"):
+        adapter.validate_material(worker, host, smuggled)
     for change in ("identity", "imageRegistryCredentials", "subnetIds"):
         altered = copy.deepcopy(material)
         if change == "identity":
@@ -732,9 +741,11 @@ def test_idle_absolute_expiry_and_inflight_crash_retire(state):
     assert store.status(sid, "owner")["status"] == "failed"
 
 
-def test_pinned_worker_transport_refuses_unverified_tls_and_changed_origins():
+def test_pinned_worker_transport_refuses_changed_origins():
     import ssl
-    context = ssl.create_default_context()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
     transport = PinnedAddressTransport(context, "worker.pool.test", "10.0.0.2", 8000)
     import httpx
     async def check():
@@ -744,9 +755,6 @@ def test_pinned_worker_transport_refuses_unverified_tls_and_changed_origins():
                 with pytest.raises(ValueError, match="origin"):
                     await transport.handle_async_request(httpx.Request("POST", url))
     asyncio.run(check())
-    context.check_hostname = False
-    with pytest.raises(ValueError, match="verification"):
-        PinnedAddressTransport(context, "worker.pool.test", "10.0.0.2", 8000)
 
 
 @pytest.fixture
@@ -760,24 +768,19 @@ def material_directory():
         shutil.rmtree(directory)
 
 
-def test_durable_material_real_cert_finalizer_idempotency_and_retirement(material_directory):
-    """Fake confcom runner is test-only; real cert issuance and finalizer are exercised."""
+def test_durable_material_finalizer_idempotency_and_retirement(material_directory):
+    """Fake confcom runner is test-only; the real finalizer is exercised. No TLS material is issued."""
     import base64
     from material import MaterialProvider, pull_configuration
     from test_pool_feasibility import issue, pem
-    from pool_worker import public_key_hash
-    from cryptography import x509
-    from cryptography.x509.oid import ExtendedKeyUsageOID
 
     directory = material_directory
-    for name in ("server-ca", "client-ca"):
-        key, cert = pem(issue(name))
-        (directory / (name + ".pem")).write_text(cert)
-        (directory / (name + ".key")).write_text(key)
+    key, cert = pem(issue("client-ca"))
+    (directory / "client-ca.pem").write_text(cert)
     calls = []
     def generate(template_path, params_path):
         calls.append(template_path)
-        assert set(json.loads(params_path.read_text())["parameters"]) .isdisjoint({"tlsCert", "tlsKey"})
+        assert set(json.loads(params_path.read_text())["parameters"]).isdisjoint({"tlsCert", "tlsKey"})
         template = json.loads(template_path.read_text())
         worker = template["resources"][0]["properties"]["containers"][0]
         definitions = [{"name": "mcp-server", "env_rules": [
@@ -790,36 +793,33 @@ def test_durable_material_real_cert_finalizer_idempotency_and_retirement(materia
     identity = "/subscriptions/" + str(uuid.uuid4()) + "/resourceGroups/pull/providers/Microsoft.ManagedIdentity/userAssignedIdentities/pull-only"
     pull = pull_configuration(identity, "registry.azurecr.io", "true", "acr-pull-only")
     def provider():
-        return MaterialProvider(directory / "material", directory / "server-ca.pem", directory / "server-ca.key",
-                                directory / "client-ca.pem", "registry.azurecr.io/worker@sha256:" + "a" * 64,
+        return MaterialProvider(directory / "material", directory / "client-ca.pem",
+                                "registry.azurecr.io/worker@sha256:" + "a" * 64,
                                 "registry.azurecr.io/sidecar@sha256:" + "b" * 64, "pilot", "eastus2",
-                                "/subscriptions/test/subnet", "https://unit.test", 3, 10, "az.cmd",
+                                "/subscriptions/test/subnet", "https://unit.test", 10, "az.cmd",
                                 pull=pull, runner=generate)
     worker = {"id": uuid.uuid4().hex, "lifetime": uuid.uuid4().hex, "created": time.time()}
     hostname = worker["id"] + ".pool.test"
     first = provider().prepare(worker, hostname)
     second = provider().prepare(worker, hostname)
     assert first == second and len(calls) == 1
-    cert = x509.load_pem_x509_certificate(first["server_cert"].encode())
-    assert cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value == x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH])
+    # The controller holds and issues no worker key or certificate.
+    assert set(first) == {"group", "policy_hash"}
+    assert not (directory / "material" / worker["id"] / "tls.json").exists()
+    assert "MCP_TLS_KEY" not in json.dumps(first) and "MCP_TLS_CERT" not in json.dumps(first)
     assert first["group"]["identity"]["userAssignedIdentities"] == {identity: {}}
     assert first["group"]["properties"]["imageRegistryCredentials"] == [{"identity": identity, "server": "registry.azurecr.io"}]
     policy = base64.b64decode(first["group"]["properties"]["confidentialComputeProperties"]["ccePolicy"])
     assert hashlib.sha256(policy).hexdigest() == first["policy_hash"]
     assert worker["id"].encode() in policy and b"MCP_TLS_CLIENT_CA=" in policy
-    other = {"id": uuid.uuid4().hex, "lifetime": uuid.uuid4().hex, "created": time.time()}
-    other_material = provider().prepare(other, other["id"] + ".pool.test")
-    assert public_key_hash(first["server_cert"].encode()) != public_key_hash(other_material["server_cert"].encode())
     with pytest.raises(PermissionError):
         provider().prepare(worker | {"lifetime": uuid.uuid4().hex}, hostname)
-    # A failed generation retains its issued key so retry cannot silently rotate identity.
     failed = {"id": uuid.uuid4().hex, "lifetime": uuid.uuid4().hex, "created": time.time()}
     failing = provider()
     failing.runner = lambda *args: (_ for _ in ()).throw(TimeoutError())
     with pytest.raises(TimeoutError):
         failing.prepare(failed, failed["id"] + ".pool.test")
-    issued = json.loads((directory / "material" / failed["id"] / "tls.json").read_text())["cert"]
-    assert provider().prepare(failed, failed["id"] + ".pool.test")["server_cert"] == issued
+    assert provider().prepare(failed, failed["id"] + ".pool.test")["policy_hash"]
     provider().forget(worker)
     provider().forget(worker)
     assert not (directory / "material" / worker["id"]).exists()
@@ -835,10 +835,8 @@ def test_base_policy_injection_binds_images_and_shape(material_directory):
     from material import MaterialProvider, pull_configuration, template_shape, worker_template
     from test_pool_feasibility import issue, pem
     directory = material_directory
-    for name in ("server-ca", "client-ca"):
-        key, cert = pem(issue(name))
-        (directory / (name + ".pem")).write_text(cert)
-        (directory / (name + ".key")).write_text(key)
+    key, cert = pem(issue("client-ca"))
+    (directory / "client-ca.pem").write_text(cert)
     identity = "/subscriptions/" + str(uuid.uuid4()) + "/resourceGroups/pull/providers/Microsoft.ManagedIdentity/userAssignedIdentities/pull-only"
     pull = pull_configuration(identity, "registry.azurecr.io", "true", "acr-pull-only")
     images = ("registry.azurecr.io/worker@sha256:" + "a" * 64, "registry.azurecr.io/sidecar@sha256:" + "b" * 64)
@@ -851,9 +849,9 @@ def test_base_policy_injection_binds_images_and_shape(material_directory):
     shape = template_shape(worker_template(images, pull))
     base.write_text(json.dumps({"images": list(images), "shape": shape, "ccePolicy": policy}))
     def provider(path=base, image=images[0]):
-        return MaterialProvider(directory / "material", directory / "server-ca.pem", directory / "server-ca.key",
-                                directory / "client-ca.pem", image, images[1], "pilot", "eastus2",
-                                "/subscriptions/test/subnet", "https://unit.test", 3, 10, "az.cmd",
+        return MaterialProvider(directory / "material", directory / "client-ca.pem",
+                                image, images[1], "pilot", "eastus2",
+                                "/subscriptions/test/subnet", "https://unit.test", 10, "az.cmd",
                                 pull=pull, policy_base=str(path))
     worker = {"id": uuid.uuid4().hex, "lifetime": uuid.uuid4().hex, "created": time.time()}
     result = provider().prepare(worker, worker["id"] + ".pool.test")
@@ -862,7 +860,7 @@ def test_base_policy_injection_binds_images_and_shape(material_directory):
     assert ("MCP_WORKER_ID=" + worker["id"]).encode() in final
     shutil.rmtree(directory / "material")  # simulated controller restart: nothing persisted
     again = provider().prepare(worker, worker["id"] + ".pool.test")
-    assert again["server_cert"] == result["server_cert"] and again["policy_hash"] == result["policy_hash"]
+    assert again["policy_hash"] == result["policy_hash"]
     with pytest.raises(ValueError, match="Base policy"):
         provider(image="registry.azurecr.io/worker@sha256:" + "c" * 64)
     base.write_text(json.dumps({"images": list(images), "shape": "0" * 64, "ccePolicy": policy}))

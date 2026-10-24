@@ -62,8 +62,7 @@ def operational_directory():
     relative = Path("tests") / (".public-infra-" + uuid.uuid4().hex)
     directory = ROOT / relative
     (directory / "pki").mkdir(parents=True)
-    for name in ("server-ca.pem", "server-ca.key", "client-ca.pem",
-                 "gateway-client.pem", "gateway-client.key"):
+    for name in ("client-ca.pem", "gateway-client.pem", "gateway-client.key"):
         (directory / "pki" / name).write_text("offline-test-not-a-key", encoding="utf-8")
     try:
         yield str(relative)
@@ -190,7 +189,7 @@ def test_apps_deploy_still_previews_and_validates_first(operational_directory):
 
 
 def test_apps_missing_local_material_fails_before_azure(operational_directory):
-    (ROOT / operational_directory / "pki" / "server-ca.key").unlink()
+    (ROOT / operational_directory / "pki" / "gateway-client.key").unlink()
     result = run_script("deploy-pool-apps.ps1", app_parameters(operational_directory))
     assert "Missing operational input" in result["error"]
     assert result["calls"] == []
@@ -249,7 +248,8 @@ def test_bicep_has_no_network_defaults_and_retains_policy_boundaries():
     for name in ("dns", "ingress-dns", "state"):
         assert "name: 'link-pool-vnet'" in (POOL / "bicep" / f"{name}.bicep").read_text()
     apps = (POOL / "bicep" / "apps.bicep").read_text()
-    for secret in ("serverCaKey", "gatewayClientKey"):
+    for secret in ("clientCaCert", "gatewayClientKey"):
         assert f"@secure()\nparam {secret} string" in apps
+    assert "serverCa" not in apps and "POOL_CA_KEY" not in apps
     script = (POOL / "deploy-pool-apps.ps1").read_text()
     assert "POOL_POLICY_BASE = '/app/infra/pool/policy-base.json'" in script

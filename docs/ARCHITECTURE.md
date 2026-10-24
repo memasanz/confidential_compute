@@ -23,7 +23,6 @@ flowchart LR
             CTL["Pool controller<br/>provision / verify / retire"]
         end
         State[("Private Table lease store")]
-        Material[("Controller-held PKI material<br/>issuer keys kept outside workers")]
         subgraph Workers["Dedicated worker subnet - restrictive NSG"]
             W1["Confidential group A<br/>worker + attestation sidecar<br/>one lifetime session"]
             W2["Confidential group B<br/>worker + attestation sidecar<br/>one lifetime session"]
@@ -34,9 +33,8 @@ flowchart LR
     Agent -->|"VPN / private routing<br/>HTTPS MCP + sandbox bearer token"| GW
     GW <--> State
     CTL <--> State
-    CTL --> Material
-    GW -->|"mutual TLS"| W1
-    GW -->|"mutual TLS"| W2
+    GW -->|"mutual TLS, worker key attested"| W1
+    GW -->|"mutual TLS, worker key attested"| W2
     CTL -->|"Azure management API: create / delete"| Workers
     CTL -.->|"verify MAA token, approved policy and TLS-key binding"| MAA
     Workers -->|"restricted egress via NAT: attestation"| MAA
@@ -73,7 +71,7 @@ session or missing artifact is an error, not a success-shaped fallback.
 |---|---|---|
 | On-premises -> gateway | Entra token for `api://<sandbox-api-id>/.default`, role `Sandbox.Access`; pinned HTTPS certificate | Caller authorization and private encrypted ingress |
 | On-premises -> Foundry | Separate `DefaultAzureCredential`, Foundry/model permissions | Inference; never reuse the sandbox token |
-| Gateway -> worker | Per-worker TLS server certificate, gateway client certificate | Mutual endpoint authentication |
+| Gateway -> worker | Worker TLS key generated inside the TEE and bound by MAA evidence; gateway client certificate | Mutual endpoint authentication without a controller-issued certificate |
 | Controller <- worker evidence | MAA signature, nonce/TLS binding, policy hash, minimum SVN | Admission of approved confidential worker |
 | Gateway <-> worker content | Per-session AES-256-GCM key wrapped to the attested TEE public key | Session-specific confidentiality, integrity and replay resistance beyond TLS |
 | Controller -> Azure resources | Narrowly scoped managed identity | Provisioning, reconciliation, DNS and state |
@@ -104,7 +102,7 @@ setting, not a claim of zero service logging or retention.
 | Attestation sidecar | `mcr.microsoft.com/aci/skr`, used for evidence only; no secret release |
 | Gateway/controller | `pool-control\`; separate identities in an internal Container Apps environment |
 | Lease store | Private Entra-only Table storage; ETags and same-partition transactions |
-| PKI | Controller-held worker issuer; gateway-held client credentials; keys materialized at runtime |
+| PKI | Gateway client CA and credentials only; each worker generates its own TLS key in the TEE, so no worker issuer exists |
 | On-premises callers | `examples\pool_client.py`, scripts and notebooks |
 | Infrastructure | `infra\pool\`; explicit existing-network, registry and attestation inputs |
 
@@ -118,9 +116,8 @@ Images are digest-pinned by the CCE policy. Worker source changes require an
 image rebuild and approved policy regeneration. The pool uses no HSM or SKR;
 the sidecar name does not mean an SKR path is enabled.
 
-The current app template uses an ephemeral controller material volume.
-Persistent material storage is not implemented; review the configured
-secret/material lifecycle before production.
+The current app template uses an ephemeral controller volume for policy and
+deployment material. It holds no worker private keys.
 
 ## State of the implementation
 

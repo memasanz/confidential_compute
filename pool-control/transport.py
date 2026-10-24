@@ -26,10 +26,12 @@ from pool_worker import (SessionChannel, canonical_challenge, new_session_key, p
 
 
 class PinnedAddressTransport(httpx.AsyncHTTPTransport):
-    """Connect to authoritative IP while verifying the original DNS TLS identity."""
+    """Connect to the authoritative IP for the worker's DNS name.
+
+    Workers present a self-signed certificate, so this transport cannot verify it. WorkerTransport
+    checks the actual peer key on every response instead and trusts it only through attestation.
+    """
     def __init__(self, context, hostname, address, port):
-        if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
-            raise ValueError("Hostname and certificate verification must remain enabled")
         super().__init__(verify=context, trust_env=False, retries=0)
         self.hostname, self.address, self.port = hostname, str(ipaddress.ip_address(address)), port
 
@@ -61,10 +63,14 @@ class BoundedStream(httpx.AsyncByteStream):
 
 
 class WorkerTransport:
-    def __init__(self, ca, cert, key, dns_suffix, subnet, maa_issuer,
+    def __init__(self, cert, key, dns_suffix, subnet, maa_issuer,
                  minimum_svn, limits, allow_smt=False, signing_key=None, port=8000):
-        self.context = ssl.create_default_context(cafile=ca)
+        # Workers create their own TLS key inside the TEE, so there is no CA to verify against.
+        # The peer key is trusted only after attestation evidence commits to its fingerprint.
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.context.check_hostname = False
+        self.context.verify_mode = ssl.CERT_NONE
         self.context.load_cert_chain(cert, key)
         self.suffix = dns_suffix.strip(".")
         self.subnet = ipaddress.ip_network(subnet)
@@ -83,7 +89,12 @@ class WorkerTransport:
         self.keys = PyJWKClient(self.issuer + "/certs", timeout=10)
 
     @asynccontextmanager
-    async def connect(self, worker):
+    async def connect(self, worker, pin=""):
+        """Open an MCP session; yield (session, peer) where peer["spki"] is the worker's TLS key.
+
+        Every response must come from the same TLS key: the pin if one is given, otherwise the
+        first key seen. Callers must verify attestation against peer["spki"] before trusting it.
+        """
         r = worker["routing"]
         host, address = r["hostname"], ipaddress.ip_address(r["ip"])
         if (not re.fullmatch(r"[a-z0-9-]{1,63}", host.split(".")[0])
@@ -103,9 +114,9 @@ class WorkerTransport:
                 await asyncio.sleep(3)
         if not addresses or {a[4][0] for a in addresses} != {str(address)}:
             raise ValueError("DNS does not match authoritative private IP")
-        expected = r["spki"]
+        peer_key = {"spki": pin}
 
-        async def peer(response):
+        async def check_peer(response):
             if response.headers.get("content-encoding", "identity") != "identity":
                 raise ValueError("Compressed worker responses are not accepted")
             stream = response.extensions.get("network_stream")
@@ -114,8 +125,10 @@ class WorkerTransport:
                 raise ValueError("Actual TLS peer certificate unavailable")
             pem = x509.load_der_x509_certificate(tls.getpeercert(binary_form=True)).public_bytes(
                 serialization.Encoding.PEM)
-            if public_key_hash(pem) != expected:
-                raise ValueError("TLS peer differs from expected attested key")
+            spki = public_key_hash(pem)
+            if peer_key["spki"] and spki != peer_key["spki"]:
+                raise ValueError("TLS peer differs from the expected attested key")
+            peer_key["spki"] = spki
             # Encrypted envelopes are base64 of the plaintext reply, so allow for expansion.
             response.stream = BoundedStream(response.stream, self.limits.result_bytes * 2 + 4096)
 
@@ -124,15 +137,19 @@ class WorkerTransport:
                 trust_env=False, follow_redirects=False,
                 headers={"Accept-Encoding": "identity"},
                 timeout=httpx.Timeout(self.limits.operation, connect=10),
-                event_hooks={"response": [peer]}) as client:
+                event_hooks={"response": [check_peer]}) as client:
             async with streamable_http_client(
                     f"https://{host}:{self.port}/mcp", http_client=client) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    yield session
+                    yield session, peer_key
 
-    async def verify(self, session, worker):
-        """Verify fresh evidence on this connection; return the attested worker session public key."""
+    async def verify(self, session, peer_key, worker):
+        """Verify fresh evidence that commits to the TLS key seen on this connection.
+
+        Returns the attested worker session public key. A different key on the wire, such as a
+        man in the middle, produces a challenge the hardware never signed, so verification fails.
+        """
         nonce, requested = secrets.token_urlsafe(32), time.time()
         result = await session.call_tool("get_attestation", {"nonce": nonce})
         if result.isError:
@@ -140,7 +157,7 @@ class WorkerTransport:
         evidence = json.loads(result.content[0].text)
         token, public_key = evidence["token"], evidence["session_public_key"]
         challenge = canonical_challenge(worker["id"], worker["lifetime"], nonce,
-                                        worker["routing"]["spki"], public_key)
+                                        peer_key["spki"], public_key)
         key = self.signing_key
         if key is None:
             key = (await asyncio.to_thread(self.keys.get_signing_key_from_jwt, token)).key
@@ -150,13 +167,13 @@ class WorkerTransport:
         return public_key
 
     async def ready(self, worker):
-        async with self.connect(worker) as session:
-            await self.verify(session, worker)
+        async with self.connect(worker) as (session, peer_key):
+            await self.verify(session, peer_key, worker)
 
     async def activate(self, worker):
         # Fresh verification and activation on the same authenticated MCP connection.
-        async with self.connect(worker) as session:
-            await self.verify(session, worker)
+        async with self.connect(worker) as (session, peer_key):
+            await self.verify(session, peer_key, worker)
             result = await session.call_tool("create_session", {"session_id": worker["lifetime"]})
             if result.isError:
                 raise ValueError("Activation failed")
@@ -164,21 +181,22 @@ class WorkerTransport:
     async def establish(self, worker):
         """Release a new random session key only after fresh attestation, on the same connection.
 
-        The key exists only in this process and in the attested worker; it is never stored.
+        The key exists only in this process and in the attested worker; it is never stored. It is
+        wrapped to the attested public key, so it is useless to anyone else even on the wire.
         """
         context = f"{worker['id']}:{worker['lifetime']}".encode("ascii")
-        async with self.connect(worker) as session:
-            public_key = await self.verify(session, worker)
+        async with self.connect(worker) as (session, peer_key):
+            public_key = await self.verify(session, peer_key, worker)
             session_key = new_session_key()
             result = await session.call_tool(
                 "establish_session_key",
                 {"wrapped_key": wrap_session_key(public_key, session_key, context)})
             if result.isError:
                 raise ValueError("Session key release failed")
-        return SessionChannel(session_key, context)
+        return SessionChannel(session_key, context, peer_key["spki"])
 
     async def invoke(self, worker, channel, name, arguments):
-        async with self.connect(worker) as session:
+        async with self.connect(worker, channel.tls_spki) as (session, _):
             result = await session.call_tool(
                 "invoke", {"envelope": channel.seal_request({"tool": name, "arguments": arguments})})
             if result.isError:
@@ -188,5 +206,6 @@ class WorkerTransport:
                               isError=reply["error"])
 
     async def call(self, worker, name, arguments):
-        async with self.connect(worker) as session:
+        # Plain calls are limited to evidence retrieval, which the caller verifies itself.
+        async with self.connect(worker) as (session, _):
             return await session.call_tool(name, arguments)

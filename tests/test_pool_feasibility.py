@@ -13,14 +13,16 @@ from pathlib import Path
 
 import jwt
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "mcp-build-sandbox"))
 sys.path.insert(0, str(ROOT / "infra" / "pool"))
 from pool_worker import (LifetimeSession, SessionChannel, canonical_challenge, new_session_key,
-                         new_worker_keypair, public_key_hash, unwrap_session_key, validate_tls,
-                         verify_maa_token, wrap_session_key)
+                         new_tls_identity, new_worker_keypair, public_key_hash, unwrap_session_key,
+                         validate_client_trust, verify_maa_token, wrap_session_key)
 from make_pki import issue, pem, write_private
 from finalize_policy import finalize
 
@@ -123,12 +125,12 @@ def test_attestation_challenge_and_errors(monkeypatch, local):
 
 @pytest.fixture
 def pki(local):
-    client_ca, server_ca = issue("client-ca"), issue("server-ca")
-    pairs = {"client-ca": client_ca, "server-ca": server_ca,
-             "server": issue("localhost", server_ca, ExtendedKeyUsageOID.SERVER_AUTH, "localhost"),
+    client_ca, other_ca = issue("client-ca"), issue("other-ca")
+    pairs = {"client-ca": client_ca, "other-ca": other_ca,
+             "server": issue("localhost", other_ca, ExtendedKeyUsageOID.SERVER_AUTH, "localhost"),
              "gateway": issue("gateway", client_ca, ExtendedKeyUsageOID.CLIENT_AUTH),
              "wrong-eku": issue("wrong-purpose", client_ca, ExtendedKeyUsageOID.SERVER_AUTH),
-             "foreign": issue("foreign", server_ca, ExtendedKeyUsageOID.CLIENT_AUTH)}
+             "foreign": issue("foreign", other_ca, ExtendedKeyUsageOID.CLIENT_AUTH)}
     for name, pair in pairs.items():
         key, cert = pem(pair)
         (local / f"{name}.key").write_text(key)
@@ -136,11 +138,33 @@ def pki(local):
     return local, pairs
 
 
+def unverified_context():
+    """What the gateway uses: workers are self-signed, so trust comes from attestation instead."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def test_worker_generates_its_own_tls_identity():
+    first_cert, first_key = new_tls_identity("worker.example.test")
+    second_cert, _ = new_tls_identity("worker.example.test")
+    cert = x509.load_pem_x509_certificate(first_cert)
+    assert cert.issuer == cert.subject
+    assert cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(
+        x509.DNSName) == ["worker.example.test"]
+    assert b"PRIVATE KEY" in first_key and b"PRIVATE KEY" not in first_cert
+    assert public_key_hash(first_cert) != public_key_hash(second_cert)
+
+
 def test_real_tls_client_purposes(pki):
     path, _ = pki
-    validate_tls(str(path / "server.pem"), str(path / "server.key"), str(path / "client-ca.pem"), "localhost")
+    validate_client_trust(str(path / "client-ca.pem"))
+    cert_pem, key_pem = new_tls_identity("localhost")
+    (path / "tls.pem").write_bytes(cert_pem)
+    (path / "tls.key").write_bytes(key_pem)
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    server_context.load_cert_chain(str(path / "server.pem"), str(path / "server.key"))
+    server_context.load_cert_chain(str(path / "tls.pem"), str(path / "tls.key"))
     server_context.load_verify_locations(str(path / "client-ca.pem"))
     server_context.verify_mode = ssl.CERT_REQUIRED
     listener = socket.socket()
@@ -162,7 +186,7 @@ def test_real_tls_client_purposes(pki):
     thread.start()
     try:
         for name in (None, "wrong-eku", "server", "foreign", "gateway"):
-            context = ssl.create_default_context(cafile=str(path / "server-ca.pem"))
+            context = unverified_context()
             if name:
                 context.load_cert_chain(str(path / f"{name}.pem"), str(path / f"{name}.key"))
             try:
@@ -182,25 +206,22 @@ def test_real_tls_client_purposes(pki):
 def test_tls_configuration_fails_closed(monkeypatch, local, pki):
     path, _ = pki
     with pytest.raises(ValueError):
-        validate_tls(None, None, None, "")
+        validate_client_trust(str(path / "gateway.pem"))
+    (path / "bundle.pem").write_text((path / "client-ca.pem").read_text() + (path / "client-ca.key").read_text())
     with pytest.raises(ValueError):
-        validate_tls(str(path / "server.pem"), str(path / "server.key"),
-                     str(path / "client-ca.pem"), "wrong.test")
-    with pytest.raises(ValueError):
-        validate_tls(str(path / "server.pem"), str(path / "server.key"),
-                     str(path / "server-ca.pem"), "localhost")
-    with pytest.raises(ssl.SSLError):
-        validate_tls(str(path / "server.pem"), str(path / "gateway.key"),
-                     str(path / "client-ca.pem"), "localhost")
+        validate_client_trust(str(path / "bundle.pem"))
     server = load_server(monkeypatch, local)
     with pytest.raises(ValueError):
         server.transport_options()
-    server.TLS_CERTFILE, server.TLS_KEYFILE = str(path / "server.pem"), str(path / "server.key")
     server.TLS_CLIENT_CAFILE, server.WORKER_HOSTNAME = str(path / "client-ca.pem"), "localhost"
     server.SKR_MAA_ENDPOINT = "test.attest.azure.net"
     options = server.transport_options()
     assert options["ssl_cert_reqs"] == ssl.CERT_REQUIRED
     assert options["proxy_headers"] is False
+    # The worker's own key is the one attestation will commit to, and it is not configurable.
+    served = Path(options["ssl_certfile"]).read_bytes()
+    assert server.TLS_SPKI_SHA256 == public_key_hash(served)
+    assert not hasattr(server, "TLS_CERT") and not hasattr(server, "TLS_KEY")
 
 
 def test_real_uvicorn_mtls_mcp_lifecycle(monkeypatch, local, pki, hostile_loopback_environment):
@@ -213,7 +234,6 @@ def test_real_uvicorn_mtls_mcp_lifecycle(monkeypatch, local, pki, hostile_loopba
 
     path, _ = pki
     worker = load_server(monkeypatch, local)
-    worker.TLS_CERTFILE, worker.TLS_KEYFILE = str(path / "server.pem"), str(path / "server.key")
     worker.TLS_CLIENT_CAFILE, worker.WORKER_HOSTNAME = str(path / "client-ca.pem"), "localhost"
     worker.SKR_MAA_ENDPOINT = "test.attest.azure.net"
     app = worker.mcp.streamable_http_app()
@@ -235,20 +255,20 @@ def test_real_uvicorn_mtls_mcp_lifecycle(monkeypatch, local, pki, hostile_loopba
         assert server.started
         url = f"https://localhost:{port}/mcp"
         for name in (None, "wrong-eku", "server", "foreign"):
-            context = ssl.create_default_context(cafile=str(path / "server-ca.pem"))
+            context = unverified_context()
             if name:
                 context.load_cert_chain(str(path / f"{name}.pem"), str(path / f"{name}.key"))
             with pytest.raises(httpx.TransportError):
                 with httpx.Client(transport=LoopbackTransport(context), trust_env=False, timeout=5) as client:
                     client.get(url)
-        context = ssl.create_default_context(cafile=str(path / "server-ca.pem"))
+        context = unverified_context()
         context.load_cert_chain(str(path / "gateway.pem"), str(path / "gateway.key"))
+        # The key on the wire is the one the worker will attest to, so the gateway can bind to it.
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            with context.wrap_socket(sock) as tls:
+                observed = x509.load_der_x509_certificate(tls.getpeercert(binary_form=True))
+        assert public_key_hash(observed.public_bytes(serialization.Encoding.PEM)) == worker.TLS_SPKI_SHA256
         async def exercise():
-            # Numeric TCP routing must NOT weaken original-hostname TLS verification.
-            async with httpx.AsyncClient(
-                    transport=AsyncLoopbackTransport(context), trust_env=False, timeout=5) as wrong:
-                with pytest.raises(httpx.TransportError):
-                    await wrong.get(f"https://wrong-host.invalid:{port}/mcp")
             async with (
                 httpx.AsyncClient(transport=AsyncLoopbackTransport(context), timeout=httpx.Timeout(30, read=300),
                                   trust_env=False,
@@ -492,7 +512,6 @@ def test_finalize_is_local_only():
         "workerId": "worker-a", "sessionId": "session-a",
         "workerHostname": "a.example.test", "clientCa": client_ca,
         "maaEndpoint": "maa.example.test",
-        "tlsCert": "offline-test-certificate", "tlsKey": "offline-test-key",
     }.items()}}
     assert "identity" not in template["resources"][0]
     assert "imageRegistryCredentials" not in template["resources"][0]["properties"]
@@ -515,7 +534,7 @@ def test_finalize_is_local_only():
     pinned = {r["pattern"].split("=")[0]: r for r in definitions[0]["env_rules"]}
     assert pinned["MCP_TLS_CLIENT_CA"]["strategy"] == "string"
     assert all(r["required"] for r in definitions[0]["env_rules"])
-    assert "(?s:MCP_TLS_CERT=.+)" in final.decode()
+    assert "MCP_TLS_CERT" not in final.decode() and "MCP_TLS_KEY" not in final.decode()
     assert finalize(template, params) == digest
     platform = {"pattern": "T(E)?MP=.+", "strategy": "re2", "required": False}
     containers[0]["env_rules"] = [*definitions[0]["env_rules"], platform,

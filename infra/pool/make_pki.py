@@ -1,8 +1,9 @@
 """Generate the pool PKI for a pilot into an ignored directory (default .azure\\pool-pilot\\pki).
 
-Creates a worker-server CA (cert+key, controller only), a dedicated gateway-client CA (public cert is
-all that workers and the controller need; its key is written for rotation only and is not deployed),
-and one gateway client certificate/key (clientAuth). Never overwrites existing files.
+Creates a dedicated gateway-client CA (public cert is all that workers and the controller need; its
+key is written for rotation only and is not deployed) and one gateway client certificate/key
+(clientAuth). There is no worker-server CA: workers generate their own TLS key inside the TEE and
+the gateway trusts it through attestation. Never overwrites existing files.
 """
 
 import argparse
@@ -57,8 +58,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     client_ca = issue("pool-gateway-client-ca", days=args.days)
-    server_ca = issue("pool-worker-server-ca", days=args.days)
-    for name, pair in (("client-ca", client_ca), ("server-ca", server_ca),
+    for name, pair in (("client-ca", client_ca),
                        ("gateway-client", issue("pool-gateway", client_ca, ExtendedKeyUsageOID.CLIENT_AUTH,
                                                 days=args.days))):
         key, cert = pem(pair)

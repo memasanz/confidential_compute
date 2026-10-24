@@ -2,7 +2,7 @@
 
 Requires az confcom and a Docker daemon (confcom pulls the images to hash their layers), so it runs on a
 trusted workstation or build agent, never in the controller (a Container App has no Docker daemon).
-Every per-worker value (IDs, hostname, client CA, MAA endpoint, TLS PEMs) is left unresolved so confcom emits
+Every per-worker value (IDs, hostname, client CA, MAA endpoint) is left unresolved so confcom emits
 wildcards; the controller's unchanged finalizer pins them per worker. The output binds the policy to the exact
 digest-pinned images and template shape; the controller refuses any mismatch.
 

@@ -7,7 +7,7 @@ POOL_TERMINAL_RETENTION, POOL_SDK_TIMEOUT, POOL_TABLE_TIMEOUT: explicit positive
 POOL_OPERATION < POOL_CLAIM, POOL_QUEUE_SIZE <=50.
 POOL_TABLE_ENDPOINT, POOL_TABLE_NAME (precreated), POOL_PARTITION,
 POOL_IDENTITY_CLIENT_ID (separate gateway/controller user-assigned identities);
-POOL_SERVER_CA, POOL_CLIENT_CERT, POOL_CLIENT_KEY (existing file paths),
+POOL_CLIENT_CERT, POOL_CLIENT_KEY (existing file paths),
 POOL_DNS_ZONE, POOL_SUBNET_CIDR, POOL_MAA_ISSUER, POOL_MINIMUM_SVN (JSON).
 Optional POOL_ALLOW_SMT must be exactly true or false (default fail-closed false).
 
@@ -118,7 +118,7 @@ def main():
     if smt not in ("true", "false"):
         raise ValueError("POOL_ALLOW_SMT must be true/false")
     transport = WorkerTransport(
-        env["POOL_SERVER_CA"], env["POOL_CLIENT_CERT"], env["POOL_CLIENT_KEY"],
+        env["POOL_CLIENT_CERT"], env["POOL_CLIENT_KEY"],
         env["POOL_DNS_ZONE"], env["POOL_SUBNET_CIDR"], env["POOL_MAA_ISSUER"],
         json.loads(env["POOL_MINIMUM_SVN"]), limits, allow_smt=smt == "true")
     if args.mode == "gateway":

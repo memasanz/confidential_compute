@@ -46,7 +46,7 @@ def finalize(template, parameters):
         raise ValueError("Worker client trust must not contain gateway or CA private keys")
     worker = next(c for c in group["containers"] if c["name"] == "mcp-server")
     env = {e["name"]: e.get("value", e.get("secureValue")) for e in worker["properties"]["environmentVariables"]}
-    if set(env) != set(expected) | {"MCP_TLS_CERT", "MCP_TLS_KEY"}:
+    if set(env) != set(expected):
         raise ValueError("Unexpected worker configuration/authentication inputs")
     for name, raw in env.items():
         parameter = re.fullmatch(r"\[parameters\('([^']+)'\)\]", raw)
@@ -66,20 +66,15 @@ def finalize(template, parameters):
                  "MCP_TLS_CLIENT_CAFILE")
     if any(any(prefix in rule["pattern"] for prefix in forbidden) for rule in rules):
         raise ValueError("Legacy authentication/path overrides are forbidden")
-    for name in [*expected, "MCP_TLS_CERT", "MCP_TLS_KEY"]:
+    for name in expected:
         matches = [r for r in rules if r["pattern"].startswith(name + "=")
                    or r["pattern"].startswith("(?s:" + name + "=")]
         if len(matches) != 1:
             raise ValueError(f"Expected one generated rule for {name}")
         rule = matches[0]
-        if name in ("MCP_TLS_CERT", "MCP_TLS_KEY"):
-            if rule["strategy"] != "re2" or rule["pattern"] not in (f"{name}=.*", f"(?s:{name}=.+)"):
-                raise ValueError(f"Generate secure PEM wildcards with --approve-wildcards: {name}")
-            rule["pattern"] = f"(?s:{name}=.+)"
-        else:
-            # Literal public config and client CA are pinned; do not wildcard identities/trust.
-            rule["strategy"] = "string"
-            rule["pattern"] = f"{name}={expected[name]}"
+        # Literal public config and client CA are pinned; do not wildcard identities/trust.
+        rule["strategy"] = "string"
+        rule["pattern"] = f"{name}={expected[name]}"
         rule["required"] = True
     definitions = json.dumps(containers, separators=(",", ":"))
     policy = policy[:match.start(1)] + definitions + policy[match.end(1):]
