@@ -1,23 +1,24 @@
-# Pilot usage and operations
+# Operations guide
 
-This is a **pilot**, not a production service or availability promise. Use an
-operator-approved environment and synthetic/low-sensitivity data only.
+Use an operator-approved environment and synthetic/low-sensitivity data until
+the open items in the [requirements assessment](requirements-assessment.md) are
+accepted. This guide is not an availability promise.
 [Setup and authentication](getting-started.md) and
 [architecture](ARCHITECTURE.md) explain prerequisites.
 
-## Historical evidence vs current state
+## Recorded evidence vs current state
 
-The small pilot's recorded live run covered create, spreadsheet upload, pandas
-analysis, result download, release, and cross-owner denial. Separate two-worker
-probes checked file/session/network separation and retirement.
+The recorded live runs covered create, spreadsheet upload, pandas analysis,
+result download, release, cross-owner denial, the per-session encrypted channel
+and hostile-code checks. Separate two-worker probes checked file/session/network
+separation and retirement.
 
-The historical configuration was 3 maximum workers and 2 desired ready workers.
-The last recorded operating decision set desired ready to zero to stop
-provisioning warm workers. That setting **does not delete existing workers**.
-No current Azure inventory or live notebook execution is claimed by this guide.
+The recorded configuration was 3 maximum workers and 2 desired ready workers.
+Setting desired ready to zero stops provisioning warm workers but **does not
+delete existing workers**. No current Azure inventory is claimed by this guide.
 The 10-ready/20-maximum target still needs load/failure/capacity acceptance.
 
-## Historical pilot limits
+## Configured limits
 
 | Setting | Value / interpretation |
 |---|---|
@@ -120,6 +121,10 @@ and an operator-reviewed environment before running:
    Confirm normal failure cleanup and define kernel/network-loss recovery.
 6. Verify controller admission logs/evidence against the approved attestation
    baseline, and verify physical worker destruction/no leaked pool groups.
+   Run the `basic` and `hostile` phases of `infra/pool/smoke.py` (as a job inside
+   the VNet with two caller identities) against the exact deployed digests.
+   Check the scheduled orphan cleaner is enabled, the gateway is a single
+   replica, and the release approval record is signed for these digests.
 7. Clear notebook execution outputs before publication. Record configuration
    and results privately without publishing tokens, secrets or environment IDs.
 

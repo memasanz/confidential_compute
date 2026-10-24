@@ -3,7 +3,7 @@
 Choose a path: **consume an existing service** from an on-premises notebook/agent,
 or **deploy the service** as an administrator. Examples do not create networking
 or deploy Container Apps, but session allocation can provision billable workers.
-Only synthetic data is appropriate for these pilot examples.
+Only synthetic data is appropriate for these examples.
 
 ## Consume an existing service
 
@@ -37,7 +37,7 @@ worker dependencies.
 
 ### Verify and pin gateway TLS
 
-The pilot internal ingress uses a self-signed certificate. Obtain the expected
+The internal ingress uses a self-signed certificate. Obtain the expected
 SHA-256 fingerprint from the operator **over a trusted channel**, then run:
 
 ```powershell
@@ -120,7 +120,7 @@ bytes stay in local code; aggregate execution output is sent to Foundry.
 
 This is a guided deployment into existing shared infrastructure, not a complete
 installer. Follow [infra\pool\README.md](../infra/pool/README.md) for explicit
-parameters and stage commands. No example silently selects the original pilot.
+parameters and stage commands. No example silently selects an original environment.
 
 Prerequisites: Azure CLI, appropriate permissions, an existing VNet with
 non-overlapping delegated subnets/private-endpoint subnet, private routing/DNS,
@@ -139,11 +139,11 @@ The infrastructure does not create the shared VPN/VNet/resolver/registry.
    `Sandbox.Access` on this API and grant admin consent. Provision its secret
    securely outside Git.
 
-Role assignment administration is in the [pilot guide](pilot-guide.md).
+Role assignment administration is in the [operations guide](operations.md).
 Deploy shared infrastructure, generate PKI and a policy base for the exact
 worker/sidecar digests, then deploy the gateway/controller and configure private
 ingress DNS. Approve attestation minimums and residual risks explicitly;
-historical pilot observations are not a universal security baseline.
+historical observations are not a universal security baseline.
 
 The sidecar produces attestation evidence only. No HSM or Secure Key Release is
 required. When releasing new worker source, rebuild/push the worker image,
@@ -161,4 +161,4 @@ Install test/runtime dependencies when preparing a development environment:
 Offline notebook tests use explicit fake MCP/model boundaries and do not call
 Azure. They establish local control flow, schemas and artifacts, not live
 confidential execution. Actual acceptance requires a separately approved
-[live release gate](pilot-guide.md#live-release-gate).
+[live release gate](operations.md#live-release-gate).

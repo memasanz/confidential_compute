@@ -92,4 +92,4 @@ quota, capacity and create/delete throughput for destroy-after-use workloads.
 - [Container Apps billing](https://learn.microsoft.com/azure/container-apps/billing)
 - [Private Link pricing](https://azure.microsoft.com/pricing/details/private-link/)
 - [DNS pricing](https://azure.microsoft.com/pricing/details/dns/)
-- [Design and limits](isolated-session-pool.md), [pilot operations](pilot-guide.md)
+- [Design and limits](isolated-session-pool.md), [operations](operations.md)

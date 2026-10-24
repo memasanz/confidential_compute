@@ -10,14 +10,15 @@ or an ordinary container. A worker's memory is encrypted against infrastructure
 host access, and the controller verifies fresh attestation before admitting it.
 Workers are **destroyed after use**, never returned to the ready pool.
 
-**Status: working pilot, not production-ready.** Historical live validation
-covered spreadsheet analysis and cross-owner denial. An Azure check on
-**2026-10-23** found a configured **3-worker maximum / 2-ready target** and two
-confidential worker groups with provisioning status `Succeeded`. This is a
-point-in-time infrastructure observation, not proof of session readiness or a
-new end-to-end validation. A 10-ready / 20-maximum pool remains an unvalidated
-scale target. See the
-[pilot guide and live release gate](docs/pilot-guide.md).
+**Status: live-validated; sign-off pending.** On **2026-10-24** the `basic` and
+`hostile` smoke phases passed against the deployed build (per-session encrypted
+channel, two-caller cross-owner denial, hostile-code limits). The pool runs a
+configured **3-worker maximum / 2-ready target**. Three requirements are
+partially met and accepted as residual risks, and the release approval record
+needs a human signature; see the
+[requirements assessment](docs/requirements-assessment.md). A 10-ready /
+20-maximum pool remains an unvalidated scale target. See the
+[operations guide and live release gate](docs/operations.md).
 
 **Pool sizing:** `POOL_MAX_TOTAL` is a configurable application limit, not a
 network limit. The code permits up to **20 total workers** and a ready target
@@ -27,7 +28,7 @@ ready workers, but three active workers leave no ready reserve. Provisioning
 and deleting workers also count toward the cap.
 
 **Deployment readiness:** another team can follow the
-[deployment guide](infra/pool/README.md) to evaluate the pilot in its own existing
+[deployment guide](infra/pool/README.md) to deploy it in your own existing
 Azure VNet. This is a guided setup, not a turnkey installer: shared networking,
 private routing/DNS, registry, identity and security approvals must be supplied.
 Fresh-environment acceptance, persistent controller material storage,
@@ -92,7 +93,7 @@ Copy-Item examples\.env.example examples\.env
 
 On managed devices, use your approved package index. Complete instructions:
 [getting started](docs/getting-started.md). For an existing service:
-[pilot guide](docs/pilot-guide.md). For deployment:
+[operations guide](docs/operations.md). For deployment:
 [infrastructure guide](infra/pool/README.md).
 
 ## Architecture and confidential boundary
@@ -112,10 +113,22 @@ does not make arbitrary code inside a worker trustworthy.
 |---|---|
 | Entra authentication | The caller has API permission; sessions belong to its validated principal |
 | Gateway-to-worker mutual TLS | The gateway reaches the authenticated worker |
-| MAA attestation + CCE policy | The admitted worker meets the approved image/policy/security baseline, bound to its TLS key |
+| MAA attestation + CCE policy | The admitted worker meets the approved image/policy/security baseline, bound to its TLS key and a TEE-generated session public key |
+| Per-session encrypted channel | Content tools are reachable only through AES-256-GCM envelopes keyed with a random per-session secret, so the transport TLS key alone cannot read or forge session content |
 
 Using one service principal for multiple people shares gateway ownership. This
 sample does not implement per-human delegated authorization.
+
+### Per-session key
+
+Each worker generates an X25519 key pair inside the TEE. Its public key is part
+of the attested challenge, so the hardware-signed report binds it to the worker.
+The gateway verifies fresh evidence, generates a random 256-bit session key in
+its own memory, wraps it to that attested key, and the worker accepts it once.
+Content operations then travel as authenticated envelopes with directional
+subkeys and a strictly increasing counter (replay resistant). The key is never
+persisted; deleting the session or restarting the gateway invalidates it, so
+the gateway runs as a single replica.
 
 ### Administrator trust model
 
@@ -126,9 +139,18 @@ RBAC, and an independent security authority controls those policies. Azure
 administrators who can change the governing policies are handled by that
 separation of duties, not by cryptography. The gateway handles plaintext by
 design. Tool results and files transit it, so its administrators must be trusted
-for the data they route. Protection against *all* Azure administrators would need
-TEE-generated keys and end-to-end encrypted payloads, which this pilot does not
-implement.
+for the data they route. Protection against *all* Azure administrators would
+also need a TEE-generated TLS key (attested TLS) and no gateway plaintext, which
+this design does not implement.
+
+**Residual risk (secret residency):** the per-session key exists only in gateway
+and worker memory. The worker's TLS private key is still created by the
+controller and injected as a worker setting, and the signing CA key is held as a
+service secret. Neither can read or forge session content, and a worker using a
+substituted TLS key fails attestation, because the attested challenge binds the
+TLS key fingerprint and the session public key. Removing the injection would
+need the worker to generate its own TLS key and the gateway to trust the
+attested fingerprint instead of a CA.
 
 ### Worker hardening
 
@@ -142,7 +164,8 @@ implement.
 - Workers never restart (`restartPolicy: Never`); a restart retires the session
   and a retry gets a new group and new material.
 - `infra/pool/orphan_cleanup.py` deletes worker groups past a maximum age using
-  ARM tags and start times only, independently of the controller.
+  ARM tags and start times only, independently of the controller. Run it on a
+  schedule (see the infrastructure guide).
 - Gateway and worker logs are content-free: no per-request lines, and tool errors
   are not logged.
 
@@ -153,12 +176,17 @@ Files: `write_file`, `read_file`, `delete_file`, `list_dir`, `upload_file`, `dow
 Execution: `run_python`, `run_command`, `run_tests`.
 Evidence and health: `get_attestation`, `get_status`.
 
+The file and execution tools are not plain MCP tools on the worker. The gateway
+exposes them to clients as before, but it calls them on the worker only inside
+the per-session encrypted channel (`establish_session_key`, then `invoke`), so
+a client or network observer never sees a plaintext worker content endpoint.
+
 `pip_install` and `git_clone` exist but fail under the configured egress
 restrictions. Bake packages into an approved, digest-pinned worker image instead.
 Workers have restricted service egress for attestation/image dependencies, not
 general-purpose internet access.
 
-Historical pilot limits: 30-minute idle / 4-hour absolute lifetime, 300-second
+Configured limits: 30-minute idle / 4-hour absolute lifetime, 300-second
 operation limit, 1 MiB bounds, and a 10-minute queue wait. JSON/base64 overhead
 reduces usable file size below the configured serialized request/result limits.
 Warm acquisition was about one minute and cold replacement about four minutes;
@@ -167,7 +195,7 @@ Warm acquisition includes controller scheduling, Azure management checks,
 fresh attestation and activation, plus client status polling. Attestation alone
 has not been timed separately, so it is not established as the bottleneck.
 
-Accepted pilot risks include SMT-enabled hosts and a pull-only registry identity
+Accepted risks include SMT-enabled hosts and a pull-only registry identity
 reachable from worker code. Because that identity is attached to the worker, its
 token endpoint (the instance metadata service) is reachable from generated code; the network
 rules cannot block that link-local address. The identity holds only `AcrPull` on
@@ -176,13 +204,18 @@ cloud metadata or management credentials" requirement. There is no HSM or Secure
 attestation sidecar's `skr` image name is historical. See the
 [design and rollout gates](docs/isolated-session-pool.md).
 
-Live hardening check (2026-10-23, hardened worker image, via the `hostile` phase
-of `infra/pool/smoke.py`): generated code ran as a non-root user with no secret
+Live check (2026-10-24, build with the per-session encrypted channel). The
+`basic` phase of `infra/pool/smoke.py` ran for two separate callers: create,
+activate, upload, pandas execution, download, delete, rejected cross-owner
+status/exec/delete, an empty cross-owner list and rejected use after delete. All
+passed through the encrypted channel. The `hostile` phase repeated the findings
+below on this build: generated code ran as a non-root user with no secret
 environment variables, could not read the server's code or environment, could
 not reach the internet, and was stopped by the process, memory and file-size
 limits; another session's files were not reachable. The metadata endpoint was
-reachable, as described above. Restart/replay and `basic` cross-owner tests have
-not yet been run live.
+reachable, as described above. Disruptive restart, replay and substitute-worker
+injection against the live pool has not been run; those cases are covered by
+automated tests. See the [requirements assessment](docs/requirements-assessment.md).
 
 ## Repository map
 
@@ -196,7 +229,7 @@ not yet been run live.
 | `docs\` | Architecture, setup, operations, design and [cost estimates](docs/session-pool-costs.md) |
 
 Offline tests use explicit fake services; they do not demonstrate live Azure
-availability or attestation. Follow the [release gate](docs/pilot-guide.md#live-release-gate)
+availability or attestation. Follow the [release gate](docs/operations.md#live-release-gate)
 before claiming a successful deployment.
 
 ## When to use this
@@ -206,5 +239,5 @@ For ordinary untrusted-code execution without that requirement, evaluate managed
 [Container Apps dynamic sessions](https://learn.microsoft.com/azure/container-apps/sessions)
 or the separate [ACA Sandboxes product](https://learn.microsoft.com/azure/container-apps/sandboxes-overview).
 Neither product is substituted here or assumed to provide this SEV-SNP
-attestation guarantee. This pilot requires you to operate the pool, PKI,
+attestation guarantee. This design requires you to operate the pool, PKI,
 networking, capacity, and lifecycle yourself.

@@ -54,7 +54,13 @@ flowchart LR
 4. Local code uploads the synthetic file. Agent tool closures bind this lease
    and submit code over MCP; the model cannot supply a worker URL or lease ID.
 5. The gateway checks ownership/lease validity on every dispatch and uses mutual
-   TLS to the worker. The model receives only the tool output returned by local code.
+   TLS to the worker. On first use it verifies fresh evidence that includes the
+   worker's TEE-generated public key, generates a random 256-bit session key, and
+   wraps it to that key. The worker accepts the key once; every content tool call
+   then travels as an AES-256-GCM envelope (directional subkeys, increasing
+   counter) through the worker's `invoke` tool. The key lives only in gateway and
+   worker memory, so the gateway runs as a single replica and a restart retires
+   its sessions. The model receives only the tool output returned by local code.
 6. Local code downloads and validates the artifact, then releases the lease in
    `finally`. The controller destroys the used group; it is never recycled.
 
@@ -69,6 +75,7 @@ session or missing artifact is an error, not a success-shaped fallback.
 | On-premises -> Foundry | Separate `DefaultAzureCredential`, Foundry/model permissions | Inference; never reuse the sandbox token |
 | Gateway -> worker | Per-worker TLS server certificate, gateway client certificate | Mutual endpoint authentication |
 | Controller <- worker evidence | MAA signature, nonce/TLS binding, policy hash, minimum SVN | Admission of approved confidential worker |
+| Gateway <-> worker content | Per-session AES-256-GCM key wrapped to the attested TEE public key | Session-specific confidentiality, integrity and replay resistance beyond TLS |
 | Controller -> Azure resources | Narrowly scoped managed identity | Provisioning, reconciliation, DNS and state |
 
 The gateway validates Entra tenant, issuer, signature, audience, validity and
@@ -117,8 +124,11 @@ secret/material lifecycle before production.
 
 ## State of the implementation
 
-The small pilot was validated historically; current runtime state is unknown.
-Scale-up, reliable client connectivity, load/failure behavior and production
-operations remain release gates. See [design](isolated-session-pool.md),
-[setup](getting-started.md), [operations](pilot-guide.md) and
+The deployment has been validated live on the current build: the per-session
+encrypted channel, cross-owner isolation and the hostile-code checks passed (see
+the README's live check). Disruptive live fault injection, scale-up, reliable
+client connectivity, load/failure behavior and production operations remain
+release gates. The [requirements assessment](requirements-assessment.md) lists
+the open items for sign-off. See [design](isolated-session-pool.md),
+[setup](getting-started.md), [operations](operations.md) and
 [cost assumptions](session-pool-costs.md).

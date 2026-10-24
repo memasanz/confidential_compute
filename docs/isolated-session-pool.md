@@ -14,7 +14,7 @@ records zero desired ready workers; current Azure state is unknown.
 
 This sharing release adds on-premises Agent Framework / Foundry examples and
 offline checks. It does not deploy or certify production readiness. See
-[architecture](ARCHITECTURE.md), [operations/live gate](pilot-guide.md) and
+[architecture](ARCHITECTURE.md), [operations/live gate](operations.md) and
 [costs](session-pool-costs.md).
 
 ## Why a group per session
