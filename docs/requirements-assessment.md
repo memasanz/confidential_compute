@@ -151,7 +151,7 @@ residual risk.
 | 21 | Protected temporary data | Met (platform deletion claim accepted) | Tests, live |
 | 22 | Direct result delivery | Met (accepted boundary) | Tests, live |
 | 23 | Content-free telemetry | Met | Code review, tests |
-| 24 | Approved, immutable deployment | **Partial** | Pinned; human sign-off pending |
+| 24 | Approved, immutable deployment | Met | Pinned; release record signed |
 | 25 | Demonstrable enforcement | Met | Tests, live fault injection |
 
 ## Requirement-by-requirement
@@ -574,8 +574,8 @@ before a key is released, so a different image cannot receive one.
 `test_finalize_is_local_only`. The approved digests and policy hash are in the release
 approval record.
 
-**Residual.** A named human approver must sign the record. Any digest or policy change
-invalidates it.
+**Residual.** The release approval record has been signed by the human approver. Any
+digest or policy change invalidates it and requires a new signature.
 
 #### 25. Demonstrable enforcement
 
@@ -610,13 +610,17 @@ pool, because they disrupt it. They are covered by automated tests.
   file size limits, cross-session read rejected). `storage`: no persistent mounts and
   no carry-over to a new group. `fault`: a worker group deletion and a gateway restart
   each retire the affected session without replay, and a fresh session then succeeds.
+- **VPN end-to-end.** On 2026-10-24 `examples/pooled_analysis.py` ran from an
+  on-premises machine over the VPN, with the gateway certificate pinned. It created a
+  session, uploaded a spreadsheet, ran pandas, downloaded the result, and released the
+  session. The output matched the expected values.
 - **Release gate.** Follow the [live release gate](operations.md#live-release-gate)
   before claiming a successful deployment.
 
 ## Open items for sign-off
 
-1. Review and sign the release approval record for the exact image and policy digests
-   (requirement 24).
+1. The release approval record for the exact image and policy digests is signed
+   (requirement 24). Re-sign after any image or policy change.
 2. Accept the documented boundaries (administrator trust, plaintext through the
    gateway, and the platform-level deletion claim for requirement 21).
 3. Complete the production release gates (load and scale tests, reliable on-premises
