@@ -62,7 +62,7 @@ class FakeAzure:
 
 class FakeTransport:
     def __init__(self):
-        self.activated, self.calls = [], []
+        self.activated, self.calls, self.established = [], [], []
         self.error, self.uncertain = False, False
         self.pause = None
 
@@ -73,6 +73,13 @@ class FakeTransport:
         self.activated.append(worker["id"])
         if self.uncertain:
             raise TimeoutError()
+
+    async def establish(self, worker):
+        self.established.append(worker["id"])
+        return object()
+
+    async def invoke(self, worker, channel, name, arguments):
+        return await self.call(worker, name, arguments)
 
     async def call(self, worker, name, arguments):
         self.calls.append((worker["id"], name, arguments))
@@ -309,6 +316,39 @@ def test_all_tools_routed_results_and_errors_unchanged(state, tool, args):
     if tool != "get_attestation":
         assert call[2]["session_id"] != sid  # Fixed lifetime identity, not client routing.
     assert store.status(sid, "owner")["status"] == "active"
+
+
+def test_session_key_established_once_and_dropped_on_release(state):
+    store, _ = state
+    sid, wid = active(store, "owner")
+    transport = FakeTransport()
+    gateway = Gateway(store, transport, lambda: "owner")
+    asyncio.run(gateway.dispatch(sid, "read_file", {"path": "x"}))
+    asyncio.run(gateway.dispatch(sid, "read_file", {"path": "y"}))
+    assert transport.established == [wid]
+    assert sid in gateway.channels
+    asyncio.run(gateway.release(sid))
+    assert sid not in gateway.channels
+
+
+def test_gateway_restart_cannot_resume_a_keyed_session(state):
+    store, _ = state
+    sid, wid = active(store, "owner")
+    first = FakeTransport()
+    asyncio.run(Gateway(store, first, lambda: "owner").dispatch(sid, "read_file", {"path": "x"}))
+    assert first.established == [wid]
+
+    # A restarted gateway has no key, and the worker accepts a session key only once.
+    restarted = FakeTransport()
+    async def refuse(worker):
+        raise PermissionError("already established")
+    restarted.establish = refuse
+    gateway = Gateway(store, restarted, lambda: "owner")
+    with pytest.raises(RuntimeError, match="not replayed"):
+        asyncio.run(gateway.dispatch(sid, "read_file", {"path": "x"}))
+    assert restarted.calls == []
+    with pytest.raises(PermissionError):
+        asyncio.run(gateway.dispatch(sid, "read_file", {"path": "x"}))
 
 
 def test_gateway_uncertain_outcome_no_replay_and_release_race(state):

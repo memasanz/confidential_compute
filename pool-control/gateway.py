@@ -14,8 +14,14 @@ from auth import authenticated_owner
 class Gateway:
     def __init__(self, store, transport, owner=authenticated_owner):
         self.store, self.transport, self.owner = store, transport, owner
+        # Per-session keys live only in this process's memory. A gateway restart loses them, which
+        # invalidates the session: a worker accepts its key once, so there is no resumption.
+        self.channels = {}
 
     async def acquire(self):
+        rows = await asyncio.to_thread(self.store.view)
+        for sid in [s for s in self.channels if rows.get("s:" + s, {}).get("state") != "active"]:
+            del self.channels[sid]
         return await asyncio.to_thread(self.store.acquire, self.owner())
 
     async def status(self, sid):
@@ -25,6 +31,7 @@ class Gateway:
         return await asyncio.to_thread(self.store.listing, self.owner())
 
     async def release(self, sid):
+        self.channels.pop(sid, None)
         return await asyncio.to_thread(self.store.release, sid, self.owner())
 
     async def dispatch(self, sid, name, arguments):
@@ -49,16 +56,23 @@ class Gateway:
             args["session_id"] = worker["lifetime"]
         try:
             async with asyncio.timeout(remaining):
-                result = await self.transport.call(worker, name, args)
+                if name == "get_attestation":
+                    result = await self.transport.call(worker, name, args)
+                else:
+                    if sid not in self.channels:
+                        self.channels[sid] = await self.transport.establish(worker)
+                    result = await self.transport.invoke(worker, self.channels[sid], name, args)
                 if len(result.model_dump_json().encode()) > limits.result_bytes:
                     raise ValueError("Result exceeds configured bound")
         except BaseException:
             # Unknown transport outcome MUST NOT be replayed. Retire the whole group.
+            self.channels.pop(sid, None)
             await asyncio.shield(asyncio.to_thread(
                 self.store.finish, sid, owner, op, generation, True))
             raise RuntimeError("Worker outcome uncertain; session retired, operation not replayed") from None
         valid = await asyncio.to_thread(self.store.finish, sid, owner, op, generation)
         if not valid:
+            self.channels.pop(sid, None)
             raise PermissionError("Lease closed or expired during operation; result discarded")
         return result
 

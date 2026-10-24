@@ -18,7 +18,9 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "mcp-build-sandbox"))
 sys.path.insert(0, str(ROOT / "infra" / "pool"))
-from pool_worker import LifetimeSession, canonical_challenge, public_key_hash, validate_tls, verify_maa_token
+from pool_worker import (LifetimeSession, SessionChannel, canonical_challenge, new_session_key,
+                         new_worker_keypair, public_key_hash, unwrap_session_key, validate_tls,
+                         verify_maa_token, wrap_session_key)
 from make_pki import issue, pem, write_private
 from finalize_policy import finalize
 
@@ -109,8 +111,9 @@ def test_attestation_challenge_and_errors(monkeypatch, local):
             return json.loads(self.text)
     monkeypatch.setattr(server.httpx, "post", lambda *a, **k: sent.append(k["json"]) or Response())
     assert "unit-fixture" in server.get_attestation(nonce)
+    assert json.loads(server.get_attestation(nonce))["session_public_key"] == server.SESSION_PUBLIC_KEY
     blob = base64.b64decode(sent[0]["runtime_data"])
-    assert blob == canonical_challenge("worker-a", "session-a", nonce, "a" * 64)
+    assert blob == canonical_challenge("worker-a", "session-a", nonce, "a" * 64, server.SESSION_PUBLIC_KEY)
     with pytest.raises(ValueError):
         server.get_attestation()
     monkeypatch.setattr(Response, "text", '{"error":"no report"}')
@@ -256,11 +259,24 @@ def test_real_uvicorn_mtls_mcp_lifecycle(monkeypatch, local, pki, hostile_loopba
                     await session.initialize()
                     async def call(name, args):
                         return await session.call_tool(name, args)
+                    channel_context = b"worker-a:session-a"
+                    key = new_session_key()
+                    async def secure(name, args):
+                        reply = await call("invoke", {"envelope": channel.seal_request(
+                            {"tool": name, "arguments": args})})
+                        return reply if reply.isError else channel.open_response(reply.content[0].text)
+                    channel = SessionChannel(key, channel_context)
+                    # Content tools are not plain MCP tools, and nothing works before key release.
                     assert (await call("write_file", {"session_id": "session-a", "path": "x", "content": "x"})).isError
+                    assert (await call("invoke", {"envelope": "{}"})).isError
                     assert not (await call("create_session", {"session_id": "session-a"})).isError
                     assert (await call("create_session", {"session_id": "session-a"})).isError
-                    assert not (await call("write_file", {"session_id": "session-a", "path": "x", "content": "x"})).isError
-                    assert (await call("read_file", {"session_id": "other", "path": "x"})).isError
+                    assert (await call("invoke", {"envelope": "{}"})).isError
+                    wrapped = wrap_session_key(worker.SESSION_PUBLIC_KEY, key, channel_context)
+                    assert not (await call("establish_session_key", {"wrapped_key": wrapped})).isError
+                    assert (await call("establish_session_key", {"wrapped_key": wrapped})).isError
+                    assert not (await secure("write_file", {"path": "x", "content": "x"}))["error"]
+                    assert (await secure("read_file", {"path": "../escape"}))["error"]
                     assert not (await call("delete_session", {"session_id": "session-a"})).isError
                     assert (await call("list_sessions", {})).isError
                     assert (await call("get_attestation", {"nonce": secrets.token_urlsafe(32)})).isError
@@ -335,7 +351,7 @@ def test_non_pooled_mode_rejected(monkeypatch, local):
 def signed_fixture():
     pair = issue("unit-test-signing-only")
     now = int(time.time())
-    challenge = canonical_challenge("w", "s", secrets.token_urlsafe(32), "a" * 64)
+    challenge = canonical_challenge("w", "s", secrets.token_urlsafe(32), "a" * 64, new_worker_keypair()[1])
     import hashlib
     claims = {
         "iss": "https://unit.test", "exp": now + 600, "nbf": now - 1, "iat": now,
@@ -354,6 +370,82 @@ def signed_fixture():
         claims[f"x-ms-sevsnpvm-{component}{'svn' if component == 'guest' else '-svn'}"] = 1
     minima["uvm_guest"] = 100
     return pair, claims, challenge, minima, now
+
+
+def test_session_key_wrap_and_encrypted_channel():
+    private, public = new_worker_keypair()
+    key, context = new_session_key(), b"worker-a:session-a"
+    assert len(key) == 32 and key != new_session_key()
+    wrapped = wrap_session_key(public, key, context)
+    assert unwrap_session_key(private, wrapped, context) == key
+    with pytest.raises(Exception):
+        unwrap_session_key(private, wrapped, b"worker-b:session-a")
+    with pytest.raises(Exception):
+        unwrap_session_key(new_worker_keypair()[0], wrapped, context)
+    gateway, worker = SessionChannel(key, context), SessionChannel(key, context)
+    first = gateway.seal_request({"tool": "read_file", "arguments": {"path": "secret.txt"}})
+    assert "secret.txt" not in first
+    assert worker.open_request(first)["tool"] == "read_file"
+    reply = worker.seal_response({"error": False, "text": "classified"})
+    assert "classified" not in reply
+    assert gateway.open_response(reply)["text"] == "classified"
+    with pytest.raises(PermissionError):
+        worker.open_request(first)  # replay
+    second = gateway.seal_request({"tool": "list_dir", "arguments": {}})
+    tampered = json.loads(second)
+    tampered["ct"] = tampered["ct"][:-2] + ("AA" if not tampered["ct"].endswith("AA") else "BB")
+    with pytest.raises(Exception):
+        worker.open_request(json.dumps(tampered))
+    assert worker.open_request(second)["tool"] == "list_dir"
+    with pytest.raises(Exception):
+        gateway.open_response(reply)  # stale reply for an earlier counter
+    other = SessionChannel(new_session_key(), context)
+    with pytest.raises(Exception):
+        other.open_request(gateway.seal_request({"tool": "x", "arguments": {}}))
+
+
+def test_worker_content_tools_require_the_session_key(monkeypatch, local):
+    import asyncio
+    worker = load_server(monkeypatch, local)
+    assert not {"write_file", "run_python", "read_file"} & {t.name for t in asyncio.run(worker.mcp.list_tools())}
+    worker.create_session("session-a")
+    with pytest.raises(PermissionError, match="not established"):
+        worker.invoke("{}")
+    context = b"worker-a:session-a"
+    key = new_session_key()
+    wrapped = wrap_session_key(worker.SESSION_PUBLIC_KEY, key, context)
+    assert worker.establish_session_key(wrapped) == "established"
+    with pytest.raises(PermissionError, match="already established"):
+        worker.establish_session_key(wrapped)
+    gateway = SessionChannel(key, context)
+    envelope = gateway.seal_request({"tool": "write_file",
+                                     "arguments": {"path": "a.txt", "content": "hello", "session_id": "other"}})
+    reply = gateway.open_response(worker.invoke(envelope))
+    assert not reply["error"] and (local / "sessions" / "session-a" / "a.txt").read_text() == "hello"
+    reply = gateway.open_response(worker.invoke(gateway.seal_request(
+        {"tool": "read_file", "arguments": {"path": "missing"}})))
+    assert reply["error"] and "missing" in reply["text"]
+    with pytest.raises(PermissionError):
+        worker.invoke(envelope)  # replayed request
+    with pytest.raises(Exception):
+        worker.invoke(SessionChannel(new_session_key(), context).seal_request(
+            {"tool": "run_command", "arguments": {"command": "id"}}))  # wrong key
+
+
+def test_substitute_worker_evidence_is_rejected():
+    pair, claims, challenge, minima, now = signed_fixture()
+    token = jwt.encode(claims, pair[0], algorithm="RS256")
+    base = json.loads(challenge)
+    # Genuine evidence for one worker must not admit another worker, session, TLS key or session key.
+    swaps = {"worker_id": "other-worker", "session_id": "other-session",
+             "tls_spki_sha256": "f" * 64, "session_public_key": new_worker_keypair()[1]}
+    for field, value in swaps.items():
+        fields = base | {field: value}
+        substitute = canonical_challenge(fields["worker_id"], fields["session_id"], fields["nonce"],
+                                         fields["tls_spki_sha256"], fields["session_public_key"])
+        with pytest.raises(ValueError):
+            verify_maa_token(token, "https://unit.test", pair[0].public_key(), substitute,
+                             "b" * 64, minima, now)
 
 
 def test_signed_claim_verifier_is_not_live_attestation():

@@ -18,9 +18,11 @@ from cryptography.hazmat.primitives import serialization
 from jwt import PyJWKClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import CallToolResult, TextContent
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mcp-build-sandbox"))
-from pool_worker import canonical_challenge, public_key_hash, verify_maa_token
+from pool_worker import (SessionChannel, canonical_challenge, new_session_key, public_key_hash,
+                         verify_maa_token, wrap_session_key)
 
 
 class PinnedAddressTransport(httpx.AsyncHTTPTransport):
@@ -114,7 +116,8 @@ class WorkerTransport:
                 serialization.Encoding.PEM)
             if public_key_hash(pem) != expected:
                 raise ValueError("TLS peer differs from expected attested key")
-            response.stream = BoundedStream(response.stream, self.limits.result_bytes)
+            # Encrypted envelopes are base64 of the plaintext reply, so allow for expansion.
+            response.stream = BoundedStream(response.stream, self.limits.result_bytes * 2 + 4096)
 
         async with httpx.AsyncClient(
                 transport=PinnedAddressTransport(self.context, host, address, self.port),
@@ -129,19 +132,22 @@ class WorkerTransport:
                     yield session
 
     async def verify(self, session, worker):
+        """Verify fresh evidence on this connection; return the attested worker session public key."""
         nonce, requested = secrets.token_urlsafe(32), time.time()
-        challenge = canonical_challenge(worker["id"], worker["lifetime"], nonce,
-                                        worker["routing"]["spki"])
         result = await session.call_tool("get_attestation", {"nonce": nonce})
         if result.isError:
             raise ValueError("Attestation failed")
-        token = json.loads(result.content[0].text)["token"]
+        evidence = json.loads(result.content[0].text)
+        token, public_key = evidence["token"], evidence["session_public_key"]
+        challenge = canonical_challenge(worker["id"], worker["lifetime"], nonce,
+                                        worker["routing"]["spki"], public_key)
         key = self.signing_key
         if key is None:
             key = (await asyncio.to_thread(self.keys.get_signing_key_from_jwt, token)).key
         verify_maa_token(token, self.issuer, key, challenge,
                          worker["routing"]["policy_hash"], self.minimum_svn,
                          requested, allow_smt=self.allow_smt)
+        return public_key
 
     async def ready(self, worker):
         async with self.connect(worker) as session:
@@ -154,6 +160,32 @@ class WorkerTransport:
             result = await session.call_tool("create_session", {"session_id": worker["lifetime"]})
             if result.isError:
                 raise ValueError("Activation failed")
+
+    async def establish(self, worker):
+        """Release a new random session key only after fresh attestation, on the same connection.
+
+        The key exists only in this process and in the attested worker; it is never stored.
+        """
+        context = f"{worker['id']}:{worker['lifetime']}".encode("ascii")
+        async with self.connect(worker) as session:
+            public_key = await self.verify(session, worker)
+            session_key = new_session_key()
+            result = await session.call_tool(
+                "establish_session_key",
+                {"wrapped_key": wrap_session_key(public_key, session_key, context)})
+            if result.isError:
+                raise ValueError("Session key release failed")
+        return SessionChannel(session_key, context)
+
+    async def invoke(self, worker, channel, name, arguments):
+        async with self.connect(worker) as session:
+            result = await session.call_tool(
+                "invoke", {"envelope": channel.seal_request({"tool": name, "arguments": arguments})})
+            if result.isError:
+                raise ValueError("Encrypted call rejected")
+            reply = channel.open_response(result.content[0].text)
+        return CallToolResult(content=[TextContent(type="text", text=reply["text"])],
+                              isError=reply["error"])
 
     async def call(self, worker, name, arguments):
         async with self.connect(worker) as session:

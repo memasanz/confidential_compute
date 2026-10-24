@@ -11,22 +11,121 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 
-def canonical_challenge(worker_id, session_id, nonce, public_key_sha256):
+def canonical_challenge(worker_id, session_id, nonce, public_key_sha256, session_public_key):
     if not all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity) for identity in (worker_id, session_id)):
         raise ValueError("Explicit worker/session identities required")
     if not re.fullmatch(r"[0-9a-f]{64}", public_key_sha256):
         raise ValueError("Validated TLS public key SHA256 required")
     if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", nonce):
         raise ValueError("Provide a fresh base64url nonce containing at least 32 random bytes")
+    if not isinstance(session_public_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", session_public_key):
+        raise ValueError("Worker session public key (X25519, base64url) required")
     return json.dumps(
-        {"version": 1, "worker_id": worker_id, "session_id": session_id,
-         "nonce": nonce, "tls_spki_sha256": public_key_sha256},
+        {"version": 2, "worker_id": worker_id, "session_id": session_id, "nonce": nonce,
+         "tls_spki_sha256": public_key_sha256, "session_public_key": session_public_key},
         sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode("ascii")
+
+
+# --- per-session key release and encrypted channel ------------------------------
+# The worker generates an X25519 key pair in TEE memory. Attestation evidence commits to the
+# public key (see canonical_challenge). After verifying fresh evidence, the gateway generates a
+# random 256-bit session key in its own memory and wraps it to that public key. Every later
+# request and response is an AES-256-GCM envelope under keys derived from the session key, so
+# transport keys alone never reveal session content. Keys are never stored, logged or persisted.
+
+def b64e(data):
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def b64d(text):
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def new_worker_keypair():
+    private = X25519PrivateKey.generate()
+    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return private, b64e(public)
+
+
+def new_session_key():
+    return os.urandom(32)
+
+
+def _wrap_key(shared, context):
+    return HKDF(hashes.SHA256(), 32, None, b"session-key-wrap|" + context).derive(shared)
+
+
+def wrap_session_key(worker_public_key, session_key, context):
+    ephemeral = X25519PrivateKey.generate()
+    shared = ephemeral.exchange(X25519PublicKey.from_public_bytes(b64d(worker_public_key)))
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(_wrap_key(shared, context)).encrypt(nonce, session_key, context)
+    ephemeral_public = ephemeral.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return json.dumps({"epk": b64e(ephemeral_public), "nonce": b64e(nonce), "ct": b64e(ciphertext)})
+
+
+def unwrap_session_key(private_key, wrapped, context):
+    message = json.loads(wrapped)
+    shared = private_key.exchange(X25519PublicKey.from_public_bytes(b64d(message["epk"])))
+    key = AESGCM(_wrap_key(shared, context)).decrypt(b64d(message["nonce"]), b64d(message["ct"]), context)
+    if len(key) != 32:
+        raise ValueError("Session key must be 256 bits")
+    return key
+
+
+class SessionChannel:
+    """Counter-based AES-256-GCM channel; one request in flight, strictly increasing counter.
+
+    A bad tag, wrong counter or replayed envelope raises and changes nothing. The gateway retires
+    the whole session on any failure, so there is no resynchronisation or resumption.
+    """
+
+    def __init__(self, session_key, context):
+        if len(session_key) != 32:
+            raise ValueError("Session key must be 256 bits")
+        keys = HKDF(hashes.SHA256(), 64, None, b"session-channel|" + context).derive(session_key)
+        self.request_key, self.response_key = AESGCM(keys[:32]), AESGCM(keys[32:])
+        self.context, self.counter = context, 0
+
+    def _seal(self, aead, label, counter, message):
+        nonce = counter.to_bytes(12, "big")
+        aad = self.context + b"|" + label + b"|" + str(counter).encode()
+        body = aead.encrypt(nonce, json.dumps(message).encode("utf-8"), aad)
+        return json.dumps({"n": counter, "ct": b64e(body)})
+
+    def _open(self, aead, label, envelope, expected):
+        message = json.loads(envelope)
+        counter = message["n"]
+        if type(counter) is not int or counter != expected:
+            raise PermissionError("Unexpected channel counter")
+        aad = self.context + b"|" + label + b"|" + str(counter).encode()
+        return json.loads(aead.decrypt(counter.to_bytes(12, "big"), b64d(message["ct"]), aad))
+
+    # Gateway side
+    def seal_request(self, message):
+        self.counter += 1
+        return self._seal(self.request_key, b"request", self.counter, message)
+
+    def open_response(self, envelope):
+        return self._open(self.response_key, b"response", envelope, self.counter)
+
+    # Worker side
+    def open_request(self, envelope):
+        message = self._open(self.request_key, b"request", envelope, self.counter + 1)
+        self.counter += 1
+        return message
+
+    def seal_response(self, message):
+        return self._seal(self.response_key, b"response", self.counter, message)
 
 
 def public_key_hash(cert_pem):

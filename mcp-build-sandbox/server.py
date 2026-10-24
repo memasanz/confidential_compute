@@ -7,6 +7,7 @@ child processes share the worker's permissions, files and environment.
 
 import base64
 import contextvars
+import json
 import os
 import re
 import shutil
@@ -20,7 +21,8 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
-from pool_worker import LifetimeSession, canonical_challenge, validate_tls
+from pool_worker import (LifetimeSession, SessionChannel, canonical_challenge, new_worker_keypair,
+                         unwrap_session_key, validate_tls)
 
 # Root for workspaces; these directories are not a security boundary.
 WORKSPACE = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
@@ -53,6 +55,19 @@ if os.environ.get("MCP_WORKER_MODE", "pooled") != "pooled":
 pool = LifetimeSession(WORKSPACE, os.environ.get("MCP_WORKER_ID", ""),
                        os.environ.get("MCP_SESSION_ID", ""))
 TLS_SPKI_SHA256 = ""
+
+# Generated in TEE memory, never written out. Attestation commits to the public half; the
+# gateway wraps the per-session key to it, and `channel` then carries every content request.
+SESSION_PRIVATE_KEY, SESSION_PUBLIC_KEY = new_worker_keypair()
+channel: SessionChannel | None = None
+
+# Content tools are reachable only through the encrypted `invoke` tool, never as plain MCP tools.
+CONTENT_TOOLS = {}
+
+
+def content_tool(function):
+    CONTENT_TOOLS[function.__name__] = function
+    return function
 
 # The identity of the caller handling the current request.
 current_caller: contextvars.ContextVar[str] = contextvars.ContextVar("current_caller", default="")
@@ -204,8 +219,10 @@ def list_sessions() -> str:
 @mcp.tool()
 def delete_session(session_id: str) -> str:
     """Retire the session and remove its workspace; does NOT delete the ACI group."""
+    global channel
     session_dir = _require_owned(session_id)
     pool.transition("retired")
+    channel = None
     if session_dir.exists():
         shutil.rmtree(session_dir)
     return f"Retired session {session_id}; controller must destroy the Azure group"
@@ -213,7 +230,7 @@ def delete_session(session_id: str) -> str:
 
 # --- file tools ---------------------------------------------------------------
 
-@mcp.tool()
+@content_tool
 def write_file(session_id: str, path: str, content: str) -> str:
     """Create or overwrite a file in the session workspace."""
     session_dir = _require_owned(session_id)
@@ -225,14 +242,14 @@ def write_file(session_id: str, path: str, content: str) -> str:
     return f"Wrote {len(content)} bytes to {path}"
 
 
-@mcp.tool()
+@content_tool
 def read_file(session_id: str, path: str) -> str:
     """Read a file from the session workspace."""
     session_dir = _require_owned(session_id)
     return _safe_path(session_dir, path).read_text(encoding="utf-8")
 
 
-@mcp.tool()
+@content_tool
 def delete_file(session_id: str, path: str) -> str:
     """Delete a file from the session workspace."""
     session_dir = _require_owned(session_id)
@@ -243,7 +260,7 @@ def delete_file(session_id: str, path: str) -> str:
     return f"Deleted {path}"
 
 
-@mcp.tool()
+@content_tool
 def list_dir(session_id: str, path: str = ".") -> str:
     """List the contents of a directory in the session workspace."""
     session_dir = _require_owned(session_id)
@@ -257,7 +274,7 @@ def list_dir(session_id: str, path: str = ".") -> str:
     return "\n".join(entries) or "(empty)"
 
 
-@mcp.tool()
+@content_tool
 def upload_file(session_id: str, path: str, content_base64: str) -> str:
     """Upload a binary file (e.g. .xlsx, .csv, .parquet) into the session.
 
@@ -274,7 +291,7 @@ def upload_file(session_id: str, path: str, content_base64: str) -> str:
     return f"Uploaded {len(data)} bytes to {path}"
 
 
-@mcp.tool()
+@content_tool
 def download_file(session_id: str, path: str) -> str:
     """Download a file from the session as base64 (e.g. a generated spreadsheet)."""
     session_dir = _require_owned(session_id)
@@ -284,7 +301,7 @@ def download_file(session_id: str, path: str) -> str:
 
 # --- code execution tools -----------------------------------------------------
 
-@mcp.tool()
+@content_tool
 def run_python(session_id: str, code: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Execute Python code in the session's virtual environment.
 
@@ -295,7 +312,7 @@ def run_python(session_id: str, code: str, timeout: int = DEFAULT_TIMEOUT) -> st
     return _run([str(_venv_python(session_dir)), "-c", code], session_dir, timeout)
 
 
-@mcp.tool()
+@content_tool
 def pip_install(session_id: str, packages: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Install packages into the session's virtual environment.
 
@@ -306,21 +323,21 @@ def pip_install(session_id: str, packages: str, timeout: int = DEFAULT_TIMEOUT) 
     return _run(args, session_dir, timeout)
 
 
-@mcp.tool()
+@content_tool
 def run_command(session_id: str, command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Run a shell command inside the session workspace and return its output."""
     session_dir = _require_owned(session_id)
     return _run_shell(command, session_dir, timeout)
 
 
-@mcp.tool()
+@content_tool
 def run_tests(session_id: str, target: str = ".", timeout: int = DEFAULT_TIMEOUT) -> str:
     """Run pytest in the session's virtual environment."""
     session_dir = _require_owned(session_id)
     return _run([str(_venv_python(session_dir)), "-m", "pytest", target], session_dir, timeout)
 
 
-@mcp.tool()
+@content_tool
 def git_clone(session_id: str, repo_url: str, directory: str = "repo") -> str:
     """Clone a git repository into the session workspace."""
     session_dir = _require_owned(session_id)
@@ -337,19 +354,58 @@ def get_status() -> str:
     return pool.require(active=False)
 
 
+# --- encrypted session channel ------------------------------------------------
+
+def _channel_context() -> bytes:
+    return f"{pool.worker_id}:{pool.session_id}".encode("ascii")
+
+
+@mcp.tool()
+def establish_session_key(wrapped_key: str) -> str:
+    """Accept the gateway's per-session key once, wrapped to the attested public key."""
+    global channel
+    _require_gateway()
+    pool.require(active=True)
+    if channel is not None:
+        raise PermissionError("Session key already established")
+    context = _channel_context()
+    channel = SessionChannel(unwrap_session_key(SESSION_PRIVATE_KEY, wrapped_key, context), context)
+    return "established"
+
+
+@mcp.tool()
+def invoke(envelope: str) -> str:
+    """Run one content tool from an encrypted request and return an encrypted reply.
+
+    Requests are authenticated with the session key, so reaching this port, holding a
+    transport credential or an Azure permission is not enough to operate the session.
+    """
+    _require_gateway()
+    pool.require(active=True)
+    if channel is None:
+        raise PermissionError("Session key not established")
+    request = channel.open_request(envelope)
+    try:
+        function = CONTENT_TOOLS[request["tool"]]
+        output, failed = function(**{**request["arguments"], "session_id": pool.session_id}), False
+    except Exception as exc:  # noqa: BLE001 - tool errors are returned inside the encrypted reply
+        output, failed = f"Error executing tool {request.get('tool')}: {exc}", True
+    return channel.seal_response({"error": failed, "text": output})
+
+
 # --- attestation --------------------------------------------------------------
 
 @mcp.tool()
 def get_attestation(nonce: str = "") -> str:
     """Obtain evidence, not proof of analysis correctness. Clients must verify it.
 
-    Pooled evidence binds a fresh client challenge to this TLS public key.
-    Authenticated pre-allocation attestation is allowed before activation.
+    Pooled evidence binds a fresh client challenge to this TLS public key and to the worker's
+    session public key. Authenticated pre-allocation attestation is allowed before activation.
     """
     _require_gateway()
     pool.require(active=False)
     runtime_data = base64.b64encode(canonical_challenge(
-        pool.worker_id, pool.session_id, nonce, TLS_SPKI_SHA256
+        pool.worker_id, pool.session_id, nonce, TLS_SPKI_SHA256, SESSION_PUBLIC_KEY
     )).decode("ascii")
     try:
         response = httpx.post(
@@ -361,7 +417,7 @@ def get_attestation(nonce: str = "") -> str:
         result = response.json()
         if not isinstance(result.get("token"), str) or not result["token"]:
             raise RuntimeError("Sidecar did not return an MAA token")
-        return response.text
+        return json.dumps({"token": result["token"], "session_public_key": SESSION_PUBLIC_KEY})
     except Exception as exc:  # noqa: BLE001 - any sidecar issue means untrusted
         raise RuntimeError("Attestation failed; worker must not be trusted") from exc
 
