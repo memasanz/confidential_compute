@@ -87,7 +87,8 @@ resource gateway 'Microsoft.App/containerApps@2024-03-01' = {
         storageType: 'Secret'
         secrets: [for f in pkiFiles: { secretRef: f.name, path: f.path }]
       }]
-      scale: { minReplicas: 1, maxReplicas: 2 }
+      // Session keys live only in this replica's memory, so scaling out would strand sessions.
+      scale: { minReplicas: 1, maxReplicas: 1 }
     }
   }
 }

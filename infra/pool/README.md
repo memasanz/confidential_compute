@@ -497,6 +497,20 @@ money even when nobody is using them.
 Do not casually change `PoolId`, `ResourcePrefix` or the PKI for an existing
 deployment; the controller uses those values to recognize/manage its workers.
 
+### Gateway replica count
+
+The gateway holds each session's encryption key in process memory only, so the
+template pins it to exactly one replica. Do not raise `maxReplicas`: a second
+replica could not decrypt sessions established by the first, and a gateway
+restart retires its active sessions (workers accept a session key only once).
+
+### Scheduled orphan cleanup
+
+`infra\pool\orphan_cleanup.py` deletes worker groups older than a maximum age
+that the controller no longer tracks. Run it on a schedule (for example a
+Container Apps job every 15 minutes with a managed identity limited to the worker
+resource group) after first running it with `--dry-run`.
+
 ## Step 9: connect from on-premises and prove the service works
 
 Provisioning succeeded does **not** mean the whole workflow has been tested.
@@ -520,7 +534,7 @@ From the actual machine that will run the agent:
 6. Have the operator confirm the session was released and its actual Azure
    worker group was destroyed. A release response alone is not proof of deletion.
 
-Complete the [live release gate](../../docs/pilot-guide.md#live-release-gate)
+Complete the [live release gate](../../docs/operations.md#live-release-gate)
 before declaring the deployment ready. Only synthetic/approved low-sensitivity
 data should be used for this pilot. Summaries sent to Foundry leave the worker's
 confidential boundary.
