@@ -71,8 +71,10 @@ These risk acceptances are **not defaults for another deployment**:
   removed by SEV-SNP memory encryption. Admission must reflect an explicitly
   approved risk decision.
 - **Registry pull identity:** private image pulls require an attached pull-only
-  identity, reachable from session code. Limit AcrPull to the intended registry
-  and explicitly approve this residual exposure.
+  identity. Generated code runs in an empty network namespace and cannot reach the
+  instance metadata endpoint that would issue its token, but the identity still exists
+  on the worker. Limit AcrPull to the intended registry and explicitly approve this
+  residual exposure.
 - **Security versions:** minimum SNP/UVM versions must be an operator-approved
   baseline, not values copied blindly from a historical host.
 
@@ -125,23 +127,79 @@ operations and 600-second queue wait. A cold replacement took about four minutes
 and deletes varied substantially. At capacity, queued sessions wait for confirmed
 retirement and a ready replacement; they may expire. Timings are not SLAs.
 
+## Lease table and session queue
+
+All pool state is one Table partition, changed only by ETag-checked
+transactions. Rows hold metadata only, never user data or keys.
+
+| Row | Purpose | Key fields |
+|---|---|---|
+| `pool` | Optimistic-concurrency root | `revision` |
+| `control` | Administrative switches | `admission_paused` |
+| `s:<id>` | One session lease | `owner`, `state`, `generation`, `created`, `queue_until`, `worker` |
+| `w:<id>` | One worker group | `state`, `lifetime`, `session`, `generation`, `claim`, `claim_until`, `delete_after` |
+
+Session states: `queued` -> `activating` -> `active` -> `closed`, or
+`expired` / `failed`. Worker states: `reserved` -> `provisioning` -> `ready` ->
+`activating` -> `active` -> `draining` -> `deleting`, or `quarantined`.
+
+1. **Create.** `create_session` adds a `queued` row with `queue_until`
+   (now + queue wait). It is refused if admission is paused or the queue is full.
+2. **Reserve.** Each controller tick adds `reserved` worker rows while total
+   workers are below the cap and unassigned workers are below the desired-ready
+   count. Capacity is held until deletion is confirmed.
+3. **Provision and verify.** A controller claims the worker (`claim_until` makes
+   the claim time-limited), creates the group, verifies MAA evidence, and marks
+   it `ready`.
+4. **Assign.** The oldest unexpired `queued` session is paired with a `ready`
+   worker in one transaction; both become `activating`, then `active` once the
+   gateway confirms the worker accepted the session key.
+5. **Retire.** Release, idle/absolute expiry or a failure bumps the session
+   `generation` and marks the worker `draining`. The worker is deleted, never
+   reused.
+6. **Sweep.** A queued session past `queue_until` becomes `expired`. Stale
+   claims are released and stuck workers are quarantined. Clients see the
+   state through `get_session_status`; a full queue is rejected at create time.
+
+Because every dispatch re-checks `generation`, a stale or retired lease cannot
+reach a worker that has been reassigned.
+
 Client cleanup cannot guarantee deletion after a killed process or broken
 network. Service TTL and operator reconciliation are required backstops.
 
-## Historical validation and removal decision
+## Validation history and removal decision
 
 The earlier two-worker probe checked fresh policy-bound confidential groups,
 file/session separation, blocked cross-worker/control access, retirement and
 destruction. The gateway pilot later checked create/upload/pandas/download/delete
 and cross-owner denial. Initial burst/queue admission did not fully pass;
 follow-up changes increased deletion timeouts, controller concurrency and queue
-wait. Those observations do not establish representative load/failure readiness.
+wait.
+
+The most recent live run (2026-10-24, 3-maximum/2-ready, on the current worker,
+sidecar and controller images and the attested-TLS channel) used the `smoke.py`
+phases as an in-VNet job with two caller identities:
+
+- `basic`: create, activate, upload, pandas run, download, delete, cross-owner
+  status/exec/delete rejected and an empty cross-owner list.
+- `hostile`: non-root user, no secrets in the environment, server code and process
+  environment unreadable, internet and instance metadata service blocked (generated
+  code runs in an empty network namespace), and process, memory and file-size bombs
+  contained.
+- `storage`: the workspace is on the container overlay filesystem with no block-device
+  or Azure Files mounts, and a marker written in one session was absent from a session
+  on a new group.
+- `fault`: deleting a worker group, and restarting the gateway, each retired the
+  affected session ("outcome uncertain, not replayed"), later calls were refused, and
+  a fresh session then activated on a new attested worker.
+
+These runs do not establish representative load, burst or scale readiness, and
+they do not exercise real on-premises/VPN connectivity.
 
 The earlier shared single-group demo, Managed HSM and SKR path were removed.
 Shared network/registry prerequisites remain roles in the design; this document
-does not assert a current inventory. The historical deployed image still
-contained inert legacy code when source cleanup was recorded. Verify/rebuild
-the actual release image rather than treating that old digest as current.
+does not assert a current inventory. Always verify or rebuild the actual release
+image rather than treating an old digest as current.
 
 ## Rollout gates
 

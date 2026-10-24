@@ -122,8 +122,9 @@ Most requirements are met by combining a small set of controls.
 ## Status at a glance
 
 **Met** means implemented and covered by tests. **Live** means it was also
-exercised against the deployed pool (`infra/pool/smoke.py`, phases `basic` and
-`hostile`, 2026-10-24). **Partial** items carry a stated residual risk.
+exercised against the deployed pool (`infra/pool/smoke.py`, phases `basic`,
+`hostile`, `storage` and `fault`, 2026-10-24). **Partial** items carry a stated
+residual risk.
 
 | # | Requirement | Status | Evidence |
 |---|---|---|---|
@@ -138,7 +139,7 @@ exercised against the deployed pool (`infra/pool/smoke.py`, phases `basic` and
 | 9 | Protected communications | Met | Tests, live |
 | 10 | Session-specific authorization | Met | Tests, live |
 | 11 | Unique ephemeral secrets | Met | Tests |
-| 12 | Restricted secret residency | **Partial** | Tests; TLS key still injected |
+| 12 | Restricted secret residency | Met | Tests, live (attested TLS) |
 | 13 | Session isolation | Met | Tests, live |
 | 14 | No recovery or resumption | Met | Tests |
 | 15 | Deterministic termination | Met | Tests, live |
@@ -146,12 +147,12 @@ exercised against the deployed pool (`infra/pool/smoke.py`, phases `basic` and
 | 17 | Interpreter functionality | Met | Tests, live |
 | 18 | Separate untrusted code | Met | Tests, live |
 | 19 | Resource limits | Met | Tests, live |
-| 20 | Restricted outbound access | **Partial** | Live; metadata endpoint reachable |
-| 21 | Protected temporary data | **Partial** | Design; not verified live |
+| 20 | Restricted outbound access | Met | Tests, live |
+| 21 | Protected temporary data | Met (platform deletion claim accepted) | Tests, live |
 | 22 | Direct result delivery | Met (accepted boundary) | Tests, live |
 | 23 | Content-free telemetry | Met | Code review, tests |
 | 24 | Approved, immutable deployment | **Partial** | Pinned; human sign-off pending |
-| 25 | Demonstrable enforcement | Met (live fault injection not run) | Tests, live |
+| 25 | Demonstrable enforcement | Met | Tests, live fault injection |
 
 ## Requirement-by-requirement
 
@@ -378,11 +379,10 @@ the TEE. Deleting the session, or restarting the gateway, destroys it.
 **Evidence.** `test_session_key_established_once_and_dropped_on_release`,
 `test_gateway_restart_cannot_resume_a_keyed_session`.
 
-**Residual (accepted).** The worker's TLS private key is derived by the controller
-and injected as a worker setting, and the signing CA key sits in a service secret.
-Neither can read or forge session content, and a substituted TLS key fails
-attestation. Closing this needs *attested TLS*, where the worker creates its own TLS
-key and the gateway trusts its attested fingerprint instead of a CA.
+**Residual.** None. The worker generates its own TLS key inside the TEE (*attested
+TLS*); the gateway trusts that key only after MAA evidence binds it, so no TLS private
+key or issuing CA key is injected into a worker. The gateway client CA is trusted
+control-plane material and cannot read or forge session content.
 
 #### 13. Session isolation
 
@@ -500,17 +500,18 @@ file were all stopped.
 cloud metadata and management credentials.
 
 **How it is satisfied.** The worker subnet's NSG denies Internet and virtual network
-egress. Only DNS, attestation, Entra and registry pulls are allowed. `pip_install` and
-`git_clone` exist but fail under those rules; packages are baked into the approved,
-digest-pinned image.
+egress. Only DNS, attestation, Entra and registry pulls are allowed. Generated code
+also runs in an empty network namespace (a new user and network namespace created
+after privileges are dropped, fail-closed), so it has no network interface at all.
+This blocks the link-local instance metadata endpoint, which an NSG cannot. Only
+`pip_install` and `git_clone` keep the network, and the NSG blocks general package and
+Git egress for them. Packages are baked into the approved, digest-pinned image.
 
-**Evidence.** `infra/pool/bicep/nsg.bicep`; live: generated code could not reach the
-internet.
+**Evidence.** `infra/pool/bicep/nsg.bicep`; live `hostile` phase: `internet` and
+`metadata_service` were both blocked.
 
-**Residual (accepted).** The worker holds a registry-pull identity, so the instance
-metadata endpoint is reachable from generated code, and a network rule cannot block that
-link-local address. The identity can only pull images from one registry. This does not
-meet a strict "no metadata access" reading.
+**Residual.** None for generated code. The worker holds a registry-pull identity, but
+code it runs cannot reach the endpoint that would issue its token.
 
 #### 21. Protected temporary data
 
@@ -521,10 +522,13 @@ protected, and what remains after destruction.
 the container's ephemeral filesystem, which is backed by encrypted TEE memory and
 discarded when the group is deleted. The workspace is size-capped for that reason.
 
-**Evidence.** Template and policy shape tests.
+**Evidence.** Template and policy shape tests; live `storage` phase: the workspace is
+on an overlay filesystem with no block-device or Azure Files mounts, a marker file
+written in one session was not found by a session on a new worker group.
 
-**Residual.** The claim that nothing persists after deletion rests on platform design
-and has not been independently verified on a live worker.
+**Residual.** The claim that nothing persists after deletion rests on platform design;
+the live check shows no mounted persistent storage and no carry-over, not what Azure
+does to the underlying host storage.
 
 #### 22. Direct result delivery
 
@@ -577,21 +581,21 @@ invalidates it.
 
 **Meaning.** Prove the controls with a working prototype and negative tests.
 
-**How it is satisfied.** A working end-to-end deployment, 126 automated tests, and live
-`basic` and `hostile` smoke phases.
+**How it is satisfied.** A working end-to-end deployment, 130 automated tests, and live
+`basic`, `hostile`, `storage` and `fault` smoke phases.
 
 | Negative case | Where covered |
 |---|---|
 | Unauthorized or cross-owner access | Tests; live rejected |
 | Modified or substituted environment | `test_substitute_worker_evidence_is_rejected`, `test_base_policy_injection_binds_images_and_shape` |
 | Replay | `test_session_key_wrap_and_encrypted_channel` |
-| Gateway restart | `test_gateway_restart_cannot_resume_a_keyed_session` |
-| Interruption or uncertain outcome | `test_gateway_uncertain_outcome_no_replay_and_release_race` |
+| Gateway restart | `test_gateway_restart_cannot_resume_a_keyed_session`; live `fault` (gateway restart retires the keyed session, no replay) |
+| Interruption or uncertain outcome | `test_gateway_uncertain_outcome_no_replay_and_release_race`; live `fault` (worker group deleted mid-session: retired, no replay, pool recovers) |
 | Sandbox escape paths | `test_generated_code_cannot_see_worker_secrets`; live `hostile` |
 | Cleanup | `test_orphan_cleanup_selects_only_old_groups_of_this_pool`; live |
 
-**Residual.** Replay, restart and substitute-worker injection have not been run
-against the live pool, because they disrupt it. They are covered by automated tests.
+**Residual.** Replay and substitute-worker injection have not been run against the live
+pool, because they disrupt it. They are covered by automated tests.
 
 ## Evidence: tests and live checks
 
@@ -599,19 +603,21 @@ against the live pool, because they disrupt it. They are covered by automated te
   controller, gateway and lease tests are in `tests/test_pool_control.py`. Offline
   tests use explicit fake Azure and attestation services, so they prove logic, not live
   availability.
-- **Live smoke.** `infra/pool/smoke.py` with `SMOKE_PHASE=basic` and `hostile`, run on
-  2026-10-24 with two separate callers: create, activate, upload, pandas run, download,
-  delete, cross-owner rejection and use-after-delete rejection; then adversarial code
-  (non-root, no secrets, server files blocked, no internet, process, memory and file
-  size limits, cross-session read rejected).
+- **Live smoke.** `infra/pool/smoke.py`, run on 2026-10-24 with two separate callers.
+  `basic`: create, activate, upload, pandas run, download, delete, cross-owner
+  rejection and use-after-delete rejection. `hostile`: adversarial code (non-root, no
+  secrets, server files blocked, no internet or metadata service, process, memory and
+  file size limits, cross-session read rejected). `storage`: no persistent mounts and
+  no carry-over to a new group. `fault`: a worker group deletion and a gateway restart
+  each retire the affected session without replay, and a fresh session then succeeds.
 - **Release gate.** Follow the [live release gate](operations.md#live-release-gate)
   before claiming a successful deployment.
 
 ## Open items for sign-off
 
-1. Accept the three partial items (12, 20, 21) as documented residual risks, or fund the
-   follow-up: attested TLS for 12, a live check of the temporary-storage claim for 21.
-2. Review and sign the release approval record for the exact image and policy digests
+1. Review and sign the release approval record for the exact image and policy digests
    (requirement 24).
-3. Decide whether to run the disruptive live negative tests (requirement 25) before
-   broader use.
+2. Accept the documented boundaries (administrator trust, plaintext through the
+   gateway, and the platform-level deletion claim for requirement 21).
+3. Complete the production release gates (load and scale tests, reliable on-premises
+   connectivity, certificate rotation, monitoring) before broader use.

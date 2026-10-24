@@ -37,7 +37,9 @@ worker dependencies.
 
 ### Verify and pin gateway TLS
 
-The internal ingress uses a self-signed certificate. Obtain the expected
+The internal ingress presents the Container Apps environment's platform-managed
+certificate (issued by a Microsoft TLS CA, about 100 days of validity, renewed by the
+platform). Obtain the expected
 SHA-256 fingerprint from the operator **over a trusted channel**, then run:
 
 ```powershell

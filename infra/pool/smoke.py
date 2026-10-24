@@ -229,7 +229,7 @@ import json, os, subprocess
 def sh(command):
     return subprocess.run(command, shell=True, capture_output=True, text=True).stdout.strip()
 
-workspace = os.environ.get("SANDBOX_WORKSPACE", "/workspace")
+workspace = os.getcwd()
 mounts = [line.split() for line in open("/proc/mounts").read().splitlines()]
 workspace_mount = max((m for m in mounts if os.path.abspath(workspace).startswith(m[1])), key=lambda m: len(m[1]))
 os.makedirs(workspace + "/probe", exist_ok=True)
@@ -256,7 +256,7 @@ async def storage(a, b):
     error, text = await a.call("create_session")
     sid = json.loads(text)["session_id"]
     log("activated_again", status=await wait_status(a, sid, {"active", "expired", "failed"}, 400))
-    log("marker_after_new_group", result=await a.call("run_python", session_id=sid, code="import glob\nprint(sorted(glob.glob('/**/marker.txt', recursive=True)))", timeout=60))
+    log("marker_after_new_group", result=await a.call("run_python", session_id=sid, code="import glob\nprint([p for root in ('/workspace', '/tmp', '/var/tmp', '/home') for p in glob.glob(root + '/**/marker.txt', recursive=True)])", timeout=60))
     log("delete", result=await a.call("delete_session", session_id=sid))
 
 

@@ -41,6 +41,60 @@ flowchart LR
     Workers -->|"image pull: pull-only identity"| ACR
 ```
 
+## What the gateway is
+
+The gateway is an **MCP server** that callers talk to. It is the only endpoint the
+on-premises agent and the model ever see. It exposes the tools a session needs:
+`create_session`, `get_session_status`, `list_sessions`, `delete_session`, the file
+tools, `run_python`, `run_command`, `run_tests`, `pip_install`, `git_clone` and
+`get_attestation`.
+
+Toward the callers it acts as a server:
+
+- It validates the caller's Entra token and checks that the caller owns the session on
+  every call.
+- Callers cannot supply a worker address or lease ID; the gateway chooses the worker
+  that belongs to the session.
+
+Toward the workers it acts as a client:
+
+- Each worker is also an MCP server, but the gateway never calls its content tools in
+  the clear. It verifies the worker's attestation, establishes a per-session key, and
+  then sends every call as an encrypted message through the worker's single `invoke`
+  tool. The worker decrypts it, runs the code and returns an encrypted result.
+
+The gateway is **not** inside the confidential boundary. It sees plaintext for the data
+it routes, which is the accepted trust boundary, and it keeps session keys only in
+memory (so it runs as one replica, and a restart retires its sessions). The worker
+group is the confidential part.
+
+## What the pool controller is
+
+The pool controller is a background service that manages the lifecycle of the workers.
+It runs as its own internal Container Apps app with its own managed identity, separate
+from the gateway, and it never sees user code, files or results. It works only from
+the lease table and the Azure resource inventory, on a repeating **tick**:
+
+- **Reserve and provision.** It keeps the configured number of warm workers and never
+  exceeds the total cap. It reserves capacity in the table first, then creates each
+  confidential group through the Azure management API, using the approved policy.
+- **Verify before admission.** A new worker is not used until fresh MAA evidence shows
+  the approved policy hash and security versions and is bound to the worker's own TLS
+  key. Workers that fail are quarantined, not used.
+- **Assign.** It pairs the oldest waiting session with a ready worker, in one
+  transaction in the lease table.
+- **Retire and delete.** Released, expired or failed sessions are retired and their
+  worker group is deleted. A worker is never recycled. Capacity stays reserved until
+  Azure confirms the deletion.
+- **Reconcile.** It compares the table with the tagged groups that actually exist and
+  repairs differences: missing, stuck, failed or half-deleted workers.
+- **Expire the queue.** Queued sessions that wait past their deadline become `expired`.
+
+A separate scheduled **orphan cleaner** job independently deletes old pool-tagged
+groups that the controller lost track of, so one failure cannot leave workers running
+indefinitely. The controller is trusted control-plane code outside the confidential
+boundary, and its Azure permissions are narrowly scoped to the pool's resources.
+
 ## Request lifecycle
 
 1. Trusted on-premises code obtains an Entra token for the sandbox API and calls

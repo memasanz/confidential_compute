@@ -54,7 +54,7 @@ def write_private(path, content):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path(".azure") / "pool-pilot" / "pki")
-    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--days", type=int, default=90)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     client_ca = issue("pool-gateway-client-ca", days=args.days)

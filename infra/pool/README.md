@@ -329,7 +329,8 @@ TEE, and the gateway trusts it only after attestation binds that key.
 The command refuses to overwrite existing files. For a new deployment, retain
 these safely; for an existing deployment, **do not delete and regenerate them
 casually**, because that changes service trust. Agree ownership, secure backup
-and rotation with the service owner. Certificates expire.
+and rotation with the service owner. Certificates expire (default 90 days); see
+the rotation runbook in [operations](../../docs/operations.md#certificate-rotation).
 
 The script has a legacy default path, so keep using the explicit output above.
 `client-ca.key` is retained for rotation, not deployed into workers.
