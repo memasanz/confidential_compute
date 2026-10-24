@@ -33,7 +33,7 @@ def check_links(source, text):
 
 
 def test_markdown_and_notebook_links():
-    assert len(MARKDOWN) == 8
+    assert len(MARKDOWN) == 9
     for path in MARKDOWN:
         check_links(path, path.read_text(encoding="utf-8"))
     for path in (ROOT / "examples").glob("*.ipynb"):
