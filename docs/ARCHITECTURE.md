@@ -138,6 +138,58 @@ the sidecar name does not mean an SKR path is enabled.
 The current app template uses an ephemeral controller volume for policy and
 deployment material. It holds no worker private keys.
 
+## Azure resources
+
+**Networking** (an existing virtual network):
+
+- A Container Apps infrastructure subnet (`Microsoft.Network/virtualNetworks/subnets`),
+  which hosts the gateway and controller.
+- A worker subnet delegated to Azure Container Instances
+  (`Microsoft.Network/virtualNetworks/subnets`, delegation `Microsoft.ContainerInstance/containerGroups`).
+  Its NSG (`Microsoft.Network/networkSecurityGroups`) denies worker-to-worker,
+  worker-to-control and worker-to-state traffic.
+- A NAT gateway for restricted worker egress (`Microsoft.Network/natGateways`).
+- Private DNS zones for the internal ingress and the worker hostnames
+  (`Microsoft.Network/privateDnsZones`).
+- VPN or ExpressRoute from on-premises (`Microsoft.Network/virtualNetworkGateways`
+  or an ExpressRoute circuit, typically already in place). This supplies a route
+  only; it does not authenticate callers.
+
+**Control side:**
+
+- A Container Apps environment, internal (`Microsoft.App/managedEnvironments`),
+  with two apps, the gateway and the controller (`Microsoft.App/containerApps`).
+- User-assigned managed identities for the gateway, the controller and the
+  registry pull (`Microsoft.ManagedIdentity/userAssignedIdentities`).
+- A private, Entra-only Azure Table storage account for the lease store
+  (`Microsoft.Storage/storageAccounts`, Table service, with a private endpoint,
+  `Microsoft.Network/privateEndpoints`).
+- An Entra app registration for the API, with the `Sandbox.Access` app role
+  (Microsoft Entra ID application, not an ARM resource).
+
+**Workers:**
+
+- Confidential ACI container groups (AMD SEV-SNP), created and deleted by the
+  controller per session and never reused (`Microsoft.ContainerInstance/containerGroups`).
+- The attestation sidecar, a second container in each worker group, used for
+  evidence only. It is not a separate resource.
+
+**Shared services:**
+
+- Azure Container Registry for the worker, sidecar and controller images, with
+  pull-only access through the pull identity (`Microsoft.ContainerRegistry/registries`).
+- Microsoft Azure Attestation, using a regional endpoint (`Microsoft.Attestation/attestationProviders`
+  for a private provider; a shared regional endpoint needs nothing to provision).
+- Azure Policy, applied at the subscription level to constrain administrative
+  access and what can be deployed (`Microsoft.Authorization/policyAssignments`).
+  It is not deployed by this project.
+
+**Role assignments** (`Microsoft.Authorization/roleAssignments`):
+
+- The controller identity creates and deletes ACI groups and uses the table.
+- The gateway identity uses the table.
+- The pull identity has pull-only access to the registry.
+
 ## State of the implementation
 
 The deployment has been validated live on the current build: the per-session
