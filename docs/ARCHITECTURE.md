@@ -200,3 +200,4 @@ release gates. The [requirements assessment](requirements-assessment.md) lists
 the open items for sign-off. See [design](isolated-session-pool.md),
 [setup](getting-started.md), [operations](operations.md) and
 [cost assumptions](session-pool-costs.md).
+
