@@ -55,7 +55,7 @@ security authority controls those policies.
 | Other sessions and other workers | **No** | One group per session; the worker subnet denies worker-to-worker traffic |
 | The network between components | **No** | Mutual TLS plus a separate per-session encrypted channel |
 | The on-premises caller | **Yes** | It owns the data and authenticates with Entra |
-| The gateway and its administrators | **Yes (accepted)** | Files and results pass through the gateway in plaintext by design |
+| The gateway and its administrators | **Yes (accepted)** | Files and results pass through the gateway in plaintext by design (see below) |
 | A separate security authority | **Yes** | Owns the policies and permissions that keep administrators out of the worker. It must be a different group from the workload administrators |
 | Microsoft platform operators | **Yes** | Normal platform controls; hardware attestation narrows this but does not remove it |
 | The Foundry model | Only for what the caller sends it | Tool results returned to the model leave the confidential boundary |
@@ -64,6 +64,26 @@ Two things this design deliberately does **not** claim: protection against
 *every* Azure administrator regardless of policy ownership, and a gateway that
 never sees plaintext. Both are in the README's
 [administrator trust model](../README.md#administrator-trust-model).
+
+### What "plaintext through the gateway" means
+
+The gateway handles your data unencrypted in its own memory. That covers the
+files you upload, the code you submit, and the results and downloads that come back.
+
+- A caller reaches the gateway over HTTPS, and the gateway ends that TLS, so it
+  sees the content. It needs to, to check ownership and route each call.
+- It then puts the content into the per-session AES-256-GCM envelope and sends it to
+  the worker over mutual TLS. Results return the same way: the gateway decrypts
+  them, then re-encrypts them over HTTPS to the caller.
+- Plaintext therefore exists in three places only: the calling application, the
+  gateway (in memory), and the worker inside the TEE. The controller, lease store,
+  logs and registry never receive file contents or code.
+- The gateway is outside the TEE. Anyone who can run code on it or capture its
+  memory could read data in transit, which is why its administrators must be
+  trusted and kept under the separately owned policies above.
+- Removing this would need encryption from the client to the worker with the
+  gateway only relaying ciphertext. The gateway could then no longer inspect
+  content, and this design does not do that.
 
 ## The controls that do the work
 

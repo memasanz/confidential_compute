@@ -2,7 +2,7 @@
 
 Env: SMOKE_URL (https://<gateway-fqdn>/mcp), SMOKE_AUDIENCE, SMOKE_CLIENT_A, SMOKE_CLIENT_B (user-assigned
 identity client IDs holding the API app role), SMOKE_TRUST (path to PEM, or "tofu" = pin the gateway
-ingress certificate presented now and print its fingerprint), SMOKE_PHASE = basic | capacity | hostile (hostile runs adversarial generated code and prints only outcome labels).
+ingress certificate presented now and print its fingerprint), SMOKE_PHASE = basic | capacity | hostile | storage | fault (storage checks mounts and that nothing survives a new group; fault waits for an operator-injected SMOKE_FAULT=worker|gateway, then checks retirement and recovery).
 Prints JSON event lines only: never tokens, keys or file contents beyond the synthetic result.
 """
 
@@ -223,6 +223,84 @@ async def hostile(a, b):
     log("delete", result=await a.call("delete_session", session_id=sid))
 
 
+STORAGE_PROBE = '''
+import json, os, subprocess
+
+def sh(command):
+    return subprocess.run(command, shell=True, capture_output=True, text=True).stdout.strip()
+
+workspace = os.environ.get("SANDBOX_WORKSPACE", "/workspace")
+mounts = [line.split() for line in open("/proc/mounts").read().splitlines()]
+workspace_mount = max((m for m in mounts if os.path.abspath(workspace).startswith(m[1])), key=lambda m: len(m[1]))
+os.makedirs(workspace + "/probe", exist_ok=True)
+open(workspace + "/probe/marker.txt", "w").write("temporary")
+print(json.dumps({
+    "workspace_mount": {"mountpoint": workspace_mount[1], "fstype": workspace_mount[2], "source": workspace_mount[0]},
+    "block_device_mounts": [m[1] for m in mounts if m[0].startswith("/dev/") and m[1] not in ("/etc/hosts", "/etc/resolv.conf", "/etc/hostname")],
+    "persistent_fstypes": sorted({m[2] for m in mounts if m[2] in ("ext4", "xfs", "btrfs", "cifs", "nfs", "nfs4", "fuse", "9p", "virtiofs")}),
+    "azure_file_mounts": [m[1] for m in mounts if m[2] in ("cifs", "nfs", "nfs4")],
+    "df_workspace": sh("df -h " + workspace + " | tail -1"),
+    "marker_written": os.path.exists(workspace + "/probe/marker.txt"),
+}))
+'''
+
+
+async def storage(a, b):
+    """Requirement 21: show no persistent volume is mounted and that nothing survives deletion."""
+    error, text = await a.call("create_session")
+    sid = json.loads(text)["session_id"]
+    log("activated", status=await wait_status(a, sid, {"active", "expired", "failed"}, 400))
+    log("storage", result=await a.call("run_python", session_id=sid, code=STORAGE_PROBE, timeout=60))
+    log("delete", result=await a.call("delete_session", session_id=sid))
+    # A new session is a new group: the earlier marker must not exist.
+    error, text = await a.call("create_session")
+    sid = json.loads(text)["session_id"]
+    log("activated_again", status=await wait_status(a, sid, {"active", "expired", "failed"}, 400))
+    log("marker_after_new_group", result=await a.call("run_python", session_id=sid, code="import glob\nprint(sorted(glob.glob('/**/marker.txt', recursive=True)))", timeout=60))
+    log("delete", result=await a.call("delete_session", session_id=sid))
+
+
+async def fault(a, b):
+    """Requirement 25: an external operator injects SMOKE_FAULT (worker or gateway) once 'ready_for_fault' is logged."""
+    error, text = await a.call("create_session")
+    sid = json.loads(text)["session_id"]
+    log("activated", status=await wait_status(a, sid, {"active", "expired", "failed"}, 400))
+    log("before_fault", result=await a.call("run_python", session_id=sid, code="print('alive')", timeout=30))
+    log("ready_for_fault", fault=os.environ["SMOKE_FAULT"], session=sid[:8])
+    for _ in range(40):
+        await asyncio.sleep(8)
+        try:
+            result = await a.call("run_python", session_id=sid, code="print('alive')", timeout=20)
+        except Exception as error:
+            result = (True, "client_error:" + type(error).__name__)
+        log("probe", result=result)
+        if result[0]:
+            break
+    for _ in range(3):
+        try:
+            status = await a.call("get_session_status", session_id=sid)
+        except Exception as error:
+            status = (True, "client_error:" + type(error).__name__)
+        log("status_after_fault", result=status)
+        if not status[0]:
+            break
+        await asyncio.sleep(10)
+    try:
+        log("exec_after_fault", result=await a.call("run_python", session_id=sid, code="print('replayed?')", timeout=20))
+    except Exception as error:
+        log("exec_after_fault", result=(True, "client_error:" + type(error).__name__))
+    # The pool must recover: a fresh session gets a new attested worker.
+    error, text = await a.call("create_session")
+    fresh = json.loads(text)["session_id"]
+    log("recovery_activated", status=await wait_status(a, fresh, {"active", "expired", "failed"}, 600))
+    log("recovery_exec", result=await a.call("run_python", session_id=fresh, code="print('recovered')", timeout=60))
+    for session in (sid, fresh):
+        try:
+            log("cleanup", result=await a.call("delete_session", session_id=session))
+        except Exception as error:
+            log("cleanup", result=(True, "client_error:" + type(error).__name__))
+
+
 async def main():
     if os.environ.get("SMOKE_PHASE") == "net":
         import socket
@@ -252,7 +330,7 @@ async def main():
     context = trust_context(url)
     a = Client("a", os.environ["SMOKE_CLIENT_A"], url, audience, context)
     b = Client("b", os.environ["SMOKE_CLIENT_B"], url, audience, context)
-    await {"basic": basic, "capacity": capacity, "hostile": hostile}[os.environ["SMOKE_PHASE"]](a, b)
+    await {"basic": basic, "capacity": capacity, "hostile": hostile, "storage": storage, "fault": fault}[os.environ["SMOKE_PHASE"]](a, b)
     log("done")
 
 

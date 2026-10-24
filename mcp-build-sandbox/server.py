@@ -7,6 +7,7 @@ child processes share the worker's permissions, files and environment.
 
 import base64
 import contextvars
+import functools
 import json
 import os
 import re
@@ -156,13 +157,19 @@ def _check_disk(session_dir: Path) -> None:
         raise ValueError("Workspace size limit exceeded")
 
 
-def _limit_child() -> None:
-    """Applied in the child before exec (Linux only): drop root, bound memory, processes, file size."""
+def _limit_child(offline: bool = False) -> None:
+    """Applied in the child before exec (Linux only): drop root, bound memory, processes, file size.
+
+    offline=True moves the child into an empty network namespace, so generated code has no
+    route to the Azure metadata endpoint or anywhere else. It fails closed if unsupported.
+    """
     import resource
     if _is_root():
         os.setgroups([])
         os.setgid(SANDBOX_UID)
         os.setuid(SANDBOX_UID)
+    if offline:
+        os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNET)
     resource.setrlimit(resource.RLIMIT_AS, (3 * 2**30, 3 * 2**30))
     resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
     resource.setrlimit(resource.RLIMIT_FSIZE, (512 * 2**20, 512 * 2**20))
@@ -170,11 +177,15 @@ def _limit_child() -> None:
     os.setsid()
 
 
-def _run(args: list[str], cwd: Path, timeout: int) -> str:
-    """Run a command and return combined output."""
+def _limiter(offline: bool):
+    return functools.partial(_limit_child, offline) if os.name == "posix" else None
+
+
+def _run(args: list[str], cwd: Path, timeout: int, offline: bool = True) -> str:
+    """Run a command and return combined output. Offline unless the tool needs the network."""
     result = subprocess.run(
         args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
-        env=_child_env(cwd), preexec_fn=_limit_child if os.name == "posix" else None,
+        env=_child_env(cwd), preexec_fn=_limiter(offline),
     )
     _check_disk(cwd)
     return f"$ {' '.join(args)}\n(exit {result.returncode})\n{result.stdout}{result.stderr}"
@@ -184,7 +195,7 @@ def _run_shell(command: str, cwd: Path, timeout: int) -> str:
     """Run a command through the system shell and return combined output."""
     result = subprocess.run(
         command, cwd=str(cwd), shell=True, capture_output=True, text=True, timeout=timeout,
-        env=_child_env(cwd), preexec_fn=_limit_child if os.name == "posix" else None,
+        env=_child_env(cwd), preexec_fn=_limiter(True),
     )
     _check_disk(cwd)
     return f"$ {command}\n(exit {result.returncode})\n{result.stdout}{result.stderr}"
@@ -318,7 +329,7 @@ def pip_install(session_id: str, packages: str, timeout: int = DEFAULT_TIMEOUT) 
     """
     session_dir = _require_owned(session_id)
     args = [str(_venv_python(session_dir)), "-m", "pip", "install", *packages.split()]
-    return _run(args, session_dir, timeout)
+    return _run(args, session_dir, timeout, offline=False)
 
 
 @content_tool
@@ -342,7 +353,7 @@ def git_clone(session_id: str, repo_url: str, directory: str = "repo") -> str:
     dest = _safe_path(session_dir, directory)
     if dest.exists():
         shutil.rmtree(dest)
-    return _run(["git", "clone", "--depth", "1", repo_url, str(dest)], session_dir, 300)
+    return _run(["git", "clone", "--depth", "1", repo_url, str(dest)], session_dir, 300, offline=False)
 
 
 @mcp.tool()

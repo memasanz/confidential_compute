@@ -80,6 +80,25 @@ The gateway validates Entra tenant, issuer, signature, audience, validity and
 permissions. Ownership comes from token claims. One shared application identity
 does **not** establish separate human owners. VPN access only supplies a route.
 
+## What MAA is and how it is used
+
+Microsoft Azure Attestation (MAA) is an Azure service that verifies hardware
+attestation evidence and returns a signed token only when the evidence is valid.
+
+- Each worker runs in an AMD SEV-SNP confidential container. The hardware
+  produces a signed report of what is running: the policy hash and the
+  firmware and security versions.
+- MAA checks that report against Microsoft's trust roots and issues a signed
+  token if it is valid.
+- The gateway verifies the MAA token before sending any session data to a worker.
+  The token must match the approved policy and meet the configured minimum
+  security versions.
+- The attestation challenge also binds the worker's TLS key fingerprint and its
+  session public key to the evidence. This binding is what makes the attested
+  TLS design work: the gateway trusts a key only because the hardware vouched
+  for it.
+- The deployment uses a shared regional MAA instance as the token issuer.
+
 ## Confidential and trusted boundaries
 
 The **worker group** is the confidential boundary, not an individual process or
